@@ -1,10 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
 import os
 import tempfile
 import wave
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -43,10 +44,22 @@ class AsrEngine:
         self.ready = False
         self.model_path = ""
         self.last_error = ""
-        self._init_model()
+        self.is_downloading = False
+        self.model_complete = False
+        self._init_model(auto_download=False)
+
+    def check_model_complete(self) -> bool:
+        if not MODEL_DIR.exists():
+            return False
+        # Check standard files for FunASR
+        required_files = ["am.mvn", "config.yaml"]
+        for f in required_files:
+            if not (MODEL_DIR / f).exists():
+                return False
+        return True
 
     def _download_model_if_needed(self) -> None:
-        if MODEL_DIR.exists():
+        if self.check_model_complete():
             self.model_path = str(MODEL_DIR)
             return
         if os.environ.get("MEETINGNOTE_DISABLE_AUTO_DOWNLOAD", "0") == "1":
@@ -64,28 +77,53 @@ class AsrEngine:
         )
         self.model_path = str(local_dir)
 
-    def _init_model(self, force_download: bool = False) -> None:
+    def _init_model(self, force_download: bool = False, auto_download: bool = True) -> None:
         if AutoModel is None:
             self.last_error = "funasr AutoModel unavailable; install funasr"
             return
+        
+        self.model_complete = self.check_model_complete()
+        
         try:
             self.last_error = ""
-            if force_download or not MODEL_DIR.exists():
+            if force_download or (auto_download and not self.model_complete):
                 self._download_model_if_needed()
-            if MODEL_DIR.exists():
+                self.model_complete = self.check_model_complete()
+                
+            if self.model_complete:
                 self.model_path = str(MODEL_DIR)
-            model_ref = self.model_path if self.model_path else MODEL_NAME
-            self.model = AutoModel(
-                model=model_ref,
-                model_hub="ms",
-                trust_remote_code=True,
-            )
-            self.ready = True
+                model_ref = self.model_path if self.model_path else MODEL_NAME
+                self.model = AutoModel(
+                    model=model_ref,
+                    model_hub="ms",
+                    trust_remote_code=True,
+                )
+                self.ready = True
+            else:
+                self.ready = False
+                self.model = None
+                if not self.last_error:
+                    self.last_error = "Model files are not complete."
         except Exception as exc:
             self.ready = False
             self.model = None
+            self.model_complete = False
             self.last_error = str(exc)
             print(f"[WARN] model init failed: {exc}")
+
+    def start_download_async(self):
+        if self.is_downloading or self.model_complete:
+            return
+        self.is_downloading = True
+        
+        def _task():
+            try:
+                self._init_model(force_download=True)
+            finally:
+                self.is_downloading = False
+                
+        t = threading.Thread(target=_task, daemon=True)
+        t.start()
 
     def _mock_segments(self) -> list[dict[str, Any]]:
         return [
@@ -172,6 +210,8 @@ def health() -> JSONResponse:
             "ready": engine.ready,
             "model_path": engine.model_path,
             "model_exists": MODEL_DIR.exists(),
+            "model_complete": engine.model_complete,
+            "is_downloading": engine.is_downloading,
             "last_error": engine.last_error,
         }
     )
@@ -179,16 +219,33 @@ def health() -> JSONResponse:
 
 @app.post("/api/model/download")
 def download_model() -> JSONResponse:
-    engine._init_model(force_download=True)
+    engine.start_download_async()
     return JSONResponse(
         {
             "ok": True,
-            "ready": engine.ready,
-            "model_path": engine.model_path,
-            "model_exists": MODEL_DIR.exists(),
-            "last_error": engine.last_error,
+            "is_downloading": engine.is_downloading,
         }
     )
+
+def get_dir_size(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return total
+    for f in path.rglob('*'):
+        if f.is_file():
+            total += f.stat().st_size
+    return total
+
+@app.get("/api/model/download_status")
+def download_status() -> JSONResponse:
+    # return the size of the temporary download cache
+    cache_dir = MODEL_DIR.parent
+    downloaded_bytes = get_dir_size(cache_dir)
+    return JSONResponse({
+        "is_downloading": engine.is_downloading,
+        "model_complete": engine.check_model_complete(),
+        "downloaded_bytes": downloaded_bytes
+    })
 
 
 @app.post("/api/transcribe")

@@ -1,7 +1,8 @@
-﻿"use client";
+"use client";
 
 import { useMemo, useRef, useState } from "react";
 import axios from "axios";
+import { ModelDownloadModal } from "@/components/ModelDownloadModal";
 
 type Segment = {
   speaker: string;
@@ -115,6 +116,7 @@ export default function HomePage() {
 
   return (
     <main className="min-h-screen p-6">
+      <ModelDownloadModal />
       <div className="mx-auto max-w-6xl rounded-2xl bg-white p-6 shadow-xl">
         <h1 className="text-2xl font-bold">MeetingNote</h1>
         <p className="mt-2 text-sm text-slate-600">聚焦会议场景：流式实时输出 + 文件转写 + 说话人识别 + Markdown 编辑导出</p>
