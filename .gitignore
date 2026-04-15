@@ -1,0 +1,9 @@
+﻿node_modules
+.next
+out
+dist
+release
+*.log
+records
+__pycache__
+*.pyc
