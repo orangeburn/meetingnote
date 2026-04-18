@@ -7,3 +7,5 @@ release
 records
 __pycache__
 *.pyc
+scratch/
+services/asr_server/models/
