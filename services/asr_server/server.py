@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import math
 import queue
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import faulthandler
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import json
  
 if sys.platform == "win32":
     # Fix for WinError 126 when torch is installed in Roaming profile
@@ -62,27 +64,136 @@ MAX_SEGMENT_CHARS = 36
 MAX_SINGLE_PASS_SECONDS = 60
 CHUNK_SECONDS = 60
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+STARTUPINFO = None
+if sys.platform == "win32":
+    STARTUPINFO = subprocess.STARTUPINFO()
+    STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    STARTUPINFO.wShowWindow = subprocess.SW_HIDE
+DB_PATH = Path(__file__).resolve().parent / "meetingnote.db"
+
+
+def hidden_subprocess_kwargs(**kwargs: Any) -> dict[str, Any]:
+    if sys.platform != "win32":
+        return kwargs
+    return {
+        **kwargs,
+        "creationflags": kwargs.get("creationflags", 0) | CREATE_NO_WINDOW,
+        "startupinfo": STARTUPINFO,
+    }
 
 
 class TranscriptionJobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self._db_path = DB_PATH
+        self._ensure_db()
+        self._load_jobs()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _ensure_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transcription_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    message TEXT NOT NULL DEFAULT '',
+                    segments_json TEXT NOT NULL DEFAULT '[]',
+                    markdown TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT '',
+                    queue_position INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+
+    def _row_to_job(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "job_id": row["job_id"],
+            "filename": row["filename"],
+            "status": row["status"],
+            "progress": row["progress"],
+            "message": row["message"],
+            "segments": json.loads(row["segments_json"] or "[]"),
+            "markdown": row["markdown"] or "",
+            "error": row["error"] or "",
+            "queue_position": row["queue_position"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _persist_job(self, job: dict[str, Any]) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO transcription_jobs (
+                    job_id, filename, status, progress, message, segments_json, markdown,
+                    error, queue_position, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    filename=excluded.filename,
+                    status=excluded.status,
+                    progress=excluded.progress,
+                    message=excluded.message,
+                    segments_json=excluded.segments_json,
+                    markdown=excluded.markdown,
+                    error=excluded.error,
+                    queue_position=excluded.queue_position,
+                    created_at=excluded.created_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    job["job_id"],
+                    job["filename"],
+                    job["status"],
+                    job["progress"],
+                    job["message"],
+                    json.dumps(job.get("segments", []), ensure_ascii=False),
+                    job.get("markdown", ""),
+                    job.get("error", ""),
+                    job.get("queue_position"),
+                    job["created_at"],
+                    job["updated_at"],
+                ),
+            )
+            conn.commit()
+
+    def _load_jobs(self) -> None:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM transcription_jobs ORDER BY datetime(updated_at) DESC, created_at DESC"
+            ).fetchall()
+        with self._lock:
+            self._jobs = {row["job_id"]: self._row_to_job(row) for row in rows}
 
     def create_job(self, filename: str) -> str:
         job_id = uuid.uuid4().hex
+        now = datetime.now().isoformat()
+        job = {
+            "job_id": job_id,
+            "filename": filename,
+            "status": "queued",
+            "progress": 0,
+            "message": "等待开始",
+            "segments": [],
+            "markdown": "",
+            "error": "",
+            "queue_position": None,
+            "created_at": now,
+            "updated_at": now,
+        }
         with self._lock:
-            self._jobs[job_id] = {
-                "job_id": job_id,
-                "filename": filename,
-                "status": "queued",
-                "progress": 0,
-                "message": "等待开始",
-                "segments": [],
-                "markdown": "",
-                "error": "",
-                "created_at": datetime.now().isoformat(),
-            }
+            self._jobs[job_id] = job
+        self._persist_job(job)
         return job_id
 
     def update_job(self, job_id: str, **fields: Any) -> None:
@@ -91,6 +202,9 @@ class TranscriptionJobStore:
             if not job:
                 return
             job.update(fields)
+            job["updated_at"] = datetime.now().isoformat()
+            snapshot = dict(job)
+        self._persist_job(snapshot)
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -98,6 +212,15 @@ class TranscriptionJobStore:
             if job is None:
                 return None
             return dict(job)
+
+    def list_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            jobs = sorted(
+                self._jobs.values(),
+                key=lambda item: item.get("updated_at", item.get("created_at", "")),
+                reverse=True,
+            )
+            return [dict(job) for job in jobs[:limit]]
 
     def get_queue_position(self, job_id: str) -> int | None:
         with self._lock:
@@ -269,10 +392,11 @@ class AsrEngine:
         ]
         completed = subprocess.run(
             cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-            creationflags=CREATE_NO_WINDOW,
+            **hidden_subprocess_kwargs(
+                capture_output=True,
+                text=True,
+                check=True,
+            ),
         )
         return max(0.0, float((completed.stdout or "0").strip() or "0"))
 
@@ -322,10 +446,11 @@ class AsrEngine:
             )
             subprocess.run(
                 cmd,
-                capture_output=True,
-                text=True,
-                check=True,
-                creationflags=CREATE_NO_WINDOW,
+                **hidden_subprocess_kwargs(
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ),
             )
             if chunk_path.exists() and chunk_path.stat().st_size > 0:
                 print(f"[INFO] prepared chunk {index + 1}/{total_chunks}: {chunk_path}")
@@ -456,8 +581,7 @@ job_queue: queue.Queue[tuple[str, Path]] = queue.Queue()
 
 
 def render_markdown(segments: list[dict[str, Any]]) -> str:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = ["# 会议转写", "", f"- 生成时间：{now}", ""]
+    lines: list[str] = []
     for seg in segments:
         start = ms_to_hhmmss(seg["start_ms"])
         end = ms_to_hhmmss(seg["end_ms"])
@@ -713,6 +837,12 @@ def get_transcription_job(job_id: str) -> JSONResponse:
     if job is None:
         return JSONResponse({"error": "job not found"}, status_code=404)
     return JSONResponse(job)
+
+
+@app.get("/api/transcribe/jobs")
+def list_transcription_jobs(limit: int = 100) -> JSONResponse:
+    limit = max(1, min(limit, 500))
+    return JSONResponse({"jobs": job_store.list_jobs(limit=limit)})
 
 
 if __name__ == "__main__":

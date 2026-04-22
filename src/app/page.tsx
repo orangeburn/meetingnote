@@ -1,53 +1,83 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import axios from "axios";
 import { ModelDownloadModal } from "@/components/ModelDownloadModal";
-
-type Segment = {
-  speaker: string;
-  start_ms: number;
-  end_ms: number;
-  text: string;
-};
-
-type JobStatus = "idle" | "uploading" | "queued" | "processing" | "completed" | "failed";
+import {
+  createTaskFromFile,
+  fetchTasksFromApi,
+  formatFileSize,
+  loadTasks,
+  mergeTaskSources,
+  normalizeTask,
+  renderMarkdown,
+  saveTasks,
+  sortTasks,
+  updateTaskCollection,
+  type JobStatus,
+  type Segment,
+  type TranscriptionTask,
+} from "@/lib/tasks";
 
 const API_BASE = "http://127.0.0.1:8765";
 
-function msToTime(ms: number): string {
-  const totalSec = Math.floor(ms / 1000);
-  const h = Math.floor(totalSec / 3600)
-    .toString()
-    .padStart(2, "0");
-  const m = Math.floor((totalSec % 3600) / 60)
-    .toString()
-    .padStart(2, "0");
-  const s = Math.floor(totalSec % 60)
-    .toString()
-    .padStart(2, "0");
-  return `${h}:${m}:${s}`;
-}
-
-function renderMarkdown(segments: Segment[]): string {
-  const lines = ["# 会议转写", "", `- 生成时间：${new Date().toLocaleString()}`, ""];
-  for (const seg of segments) {
-    lines.push(`[${msToTime(seg.start_ms)} - ${msToTime(seg.end_ms)}] [${seg.speaker}]`);
-    lines.push(seg.text || "");
-    lines.push("");
-  }
-  return lines.join("\n");
-}
-
 export default function HomePage() {
-  const [segments, setSegments] = useState<Segment[]>([]);
-  const [markdown, setMarkdown] = useState("# 会议转写\n");
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [status, setStatus] = useState<JobStatus>("idle");
-  const [statusText, setStatusText] = useState("等待上传音频文件");
-  const [progress, setProgress] = useState(0);
-  const [jobId, setJobId] = useState<string | null>(null);
+  const [tasks, setTasks] = useState<TranscriptionTask[]>([]);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const activeTaskIdRef = useRef<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    const localTasks = sortTasks(loadTasks().map(normalizeTask));
+    setTasks(localTasks);
+
+    void (async () => {
+      try {
+        const apiTasks = await fetchTasksFromApi();
+        const merged = mergeTaskSources(localTasks, apiTasks);
+        setTasks(merged);
+        saveTasks(merged);
+      } catch {
+        setTasks(localTasks);
+      }
+    })();
+  }, []);
+
+  useEffect(() => {
+    const resumableTask = tasks.find(
+      (task) =>
+        task.jobId &&
+        (task.status === "uploading" || task.status === "queued" || task.status === "processing")
+    );
+
+    if (!resumableTask || activeTaskIdRef.current === resumableTask.id || pollingRef.current) {
+      return;
+    }
+
+    const resumableJobId = resumableTask.jobId;
+    if (!resumableJobId) {
+      return;
+    }
+
+    activeTaskIdRef.current = resumableTask.id;
+    void pollJob(resumableTask.id, resumableJobId);
+    pollingRef.current = setInterval(() => {
+      void pollJob(resumableTask.id, resumableJobId);
+    }, 800);
+
+    return () => {
+      if (pollingRef.current && activeTaskIdRef.current === resumableTask.id) {
+        clearInterval(pollingRef.current);
+        pollingRef.current = null;
+        activeTaskIdRef.current = null;
+      }
+    };
+  }, [tasks]);
+
+  useEffect(() => {
+    saveTasks(tasks);
+  }, [tasks]);
 
   useEffect(() => {
     return () => {
@@ -57,69 +87,70 @@ export default function HomePage() {
     };
   }, []);
 
-  function resetResultArea() {
-    setSegments([]);
-    setMarkdown("# 会议转写\n");
-  }
-
-  async function pollJob(nextJobId: string) {
+  async function pollJob(taskId: string, nextJobId: string) {
     try {
       const resp = await axios.get(`${API_BASE}/api/transcribe/jobs/${nextJobId}`);
       const data = resp.data;
       const nextStatus = (data.status || "processing") as JobStatus;
       const nextSegments = (data.segments || []) as Segment[];
-      setStatus(nextStatus);
-      setProgress(Number(data.progress || 0));
-      setStatusText(data.message || "处理中");
+      const nextProgress = Number(data.progress || 0);
+      const nextStatusText = data.message || "处理中";
 
-      if (nextSegments.length > 0) {
-        setSegments(nextSegments);
-        setMarkdown(data.markdown || renderMarkdown(nextSegments));
-      }
+      setTasks((current) =>
+        sortTasks(
+          updateTaskCollection(current, taskId, (task) => ({
+            ...task,
+            status: nextStatus,
+            progress: nextProgress,
+            statusText: nextStatus === "failed" ? data.error || nextStatusText : nextStatusText,
+            segments: nextSegments.length > 0 ? nextSegments : task.segments,
+            markdown:
+              nextSegments.length > 0 ? data.markdown || renderMarkdown(nextSegments) : task.markdown,
+            updatedAt: new Date().toISOString(),
+            error: nextStatus === "failed" ? data.error || nextStatusText : undefined,
+          }))
+        )
+      );
 
-      if (nextStatus === "completed") {
-        setSegments(nextSegments);
-        setMarkdown(data.markdown || renderMarkdown(nextSegments));
+      if (nextStatus === "completed" || nextStatus === "failed") {
         if (pollingRef.current) {
           clearInterval(pollingRef.current);
           pollingRef.current = null;
         }
-      }
-
-      if (nextStatus === "failed") {
-        resetResultArea();
-        setStatusText(data.error || data.message || "转写失败");
-        if (pollingRef.current) {
-          clearInterval(pollingRef.current);
-          pollingRef.current = null;
-        }
+        activeTaskIdRef.current = null;
       }
     } catch (error: any) {
-      setStatus("failed");
-      setStatusText(error?.response?.data?.error || error?.message || "任务状态获取失败");
+      setTasks((current) =>
+        sortTasks(
+          updateTaskCollection(current, taskId, (task) => ({
+            ...task,
+            status: "failed",
+            statusText: error?.response?.data?.error || error?.message || "任务状态获取失败",
+            error: error?.response?.data?.error || error?.message || "任务状态获取失败",
+            updatedAt: new Date().toISOString(),
+          }))
+        )
+      );
       if (pollingRef.current) {
         clearInterval(pollingRef.current);
         pollingRef.current = null;
       }
+      activeTaskIdRef.current = null;
     }
   }
 
-  async function transcribeFile() {
-    if (!selectedFile) return;
-
+  async function transcribeFile(file: File) {
     if (pollingRef.current) {
       clearInterval(pollingRef.current);
       pollingRef.current = null;
     }
 
-    resetResultArea();
-    setJobId(null);
-    setStatus("uploading");
-    setStatusText("正在上传音频文件");
-    setProgress(0);
+    const nextTask = createTaskFromFile(file);
+    activeTaskIdRef.current = nextTask.id;
+    setTasks((current) => sortTasks([normalizeTask(nextTask), ...current]));
 
     const form = new FormData();
-    form.append("file", selectedFile);
+    form.append("file", file);
 
     try {
       const resp = await axios.post(`${API_BASE}/api/transcribe/jobs`, form, {
@@ -127,162 +158,141 @@ export default function HomePage() {
         onUploadProgress: (event) => {
           if (!event.total) return;
           const uploadPercent = Math.min(25, Math.round((event.loaded / event.total) * 25));
-          setProgress(uploadPercent);
-          setStatus("uploading");
-          setStatusText(`正在上传音频文件 ${uploadPercent}%`);
+          setTasks((current) =>
+            sortTasks(
+              updateTaskCollection(current, nextTask.id, (task) => ({
+                ...task,
+                status: "uploading",
+                progress: uploadPercent,
+                statusText: `上传中 ${uploadPercent}%`,
+                updatedAt: new Date().toISOString(),
+              }))
+            )
+          );
         },
       });
 
       const nextJobId = resp.data?.job_id as string;
-      setJobId(nextJobId);
-      setStatus("processing");
-      setStatusText("文件上传完成，开始转写");
-      setProgress((prev) => Math.max(prev, 26));
-      await pollJob(nextJobId);
+      setTasks((current) =>
+        sortTasks(
+          updateTaskCollection(current, nextTask.id, (task) => ({
+            ...task,
+            id: nextJobId,
+            jobId: nextJobId,
+            status: "processing",
+            statusText: "转录中",
+            progress: Math.max(task.progress, 26),
+            updatedAt: new Date().toISOString(),
+          }))
+        )
+      );
+      activeTaskIdRef.current = nextJobId;
+      await pollJob(nextJobId, nextJobId);
       pollingRef.current = setInterval(() => {
-        void pollJob(nextJobId);
+        void pollJob(nextJobId, nextJobId);
       }, 800);
     } catch (error: any) {
-      setStatus("failed");
-      setProgress(100);
-      setStatusText(error?.response?.data?.error || error?.message || "转写失败");
+      setTasks((current) =>
+        sortTasks(
+          updateTaskCollection(current, nextTask.id, (task) => ({
+            ...task,
+            status: "failed",
+            progress: 100,
+            statusText: error?.response?.data?.error || error?.message || "转写失败",
+            error: error?.response?.data?.error || error?.message || "转写失败",
+            updatedAt: new Date().toISOString(),
+          }))
+        )
+      );
+      activeTaskIdRef.current = null;
     }
   }
 
-  function exportMd() {
-    const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `meeting-note-${Date.now()}.md`;
-    a.click();
-    URL.revokeObjectURL(url);
+  function getStatusLabel(status: JobStatus) {
+    if (status === "uploading") return "上传中";
+    if (status === "processing" || status === "queued") return "转录中";
+    if (status === "completed") return "已完成";
+    if (status === "failed") return "失败";
+    return "待开始";
   }
 
   return (
     <main className="meetingnote-shell min-h-screen">
       <ModelDownloadModal />
       <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col px-4 py-6 sm:px-6 lg:px-8">
-        <section className="hero-panel">
-          <div>
+        <section className="compact-hero">
+          <div className="compact-hero-copy">
             <div className="eyebrow">MeetingNote</div>
-            <h1 className="hero-title">上传音频，生成可编辑的会议转写稿。</h1>
-            <p className="hero-copy">
-              仅保留文件转写流程，输出按说话人和时间戳分段，并支持实时编辑与导出。
-            </p>
-          </div>
-          <div className="hero-status-card">
-            <div className={`status-dot status-${status}`} />
-            <div>
-              <div className="text-sm text-slate-500">当前状态</div>
-              <div className="text-base font-semibold text-slate-900">{statusText}</div>
-            </div>
+            <h1 className="compact-title">转录任务</h1>
           </div>
         </section>
 
-        <section className="workspace-grid mt-6">
-          <div className="panel-card">
-            <div className="panel-header">
-              <div>
-                <div className="panel-kicker">步骤 1</div>
-                <h2 className="panel-title">上传音频文件</h2>
-              </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="audio/*"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) {
+              void transcribeFile(file);
+            }
+            e.currentTarget.value = "";
+          }}
+        />
+
+        <section className="task-grid mt-6">
+          <button
+            className="task-card task-card-create"
+            onClick={() => fileInputRef.current?.click()}
+            type="button"
+          >
+            <div className="task-card-plus" aria-hidden="true">
+              <span />
+              <span />
             </div>
+            <div className="task-card-title">新建任务</div>
+          </button>
 
-            <label className="upload-dropzone">
-              <input
-                type="file"
-                accept="audio/*"
-                className="hidden"
-                onChange={(e) => {
-                  const file = e.target.files?.[0] || null;
-                  setSelectedFile(file);
-                  if (file) {
-                    setStatus("idle");
-                    setStatusText("已选择文件，准备开始转写");
-                    setProgress(0);
-                  }
-                }}
-              />
-              <span className="upload-badge">仅支持上传音频文件</span>
-              <strong className="text-lg text-slate-900">{selectedFile ? selectedFile.name : "点击选择或拖入音频文件"}</strong>
-              <span className="text-sm text-slate-500">
-                {selectedFile
-                  ? `${(selectedFile.size / 1024 / 1024).toFixed(2)} MB`
-                  : "支持常见音频格式，转写后会保留说话人和时间戳"}
-              </span>
-            </label>
-
-            <button
-              onClick={transcribeFile}
-              disabled={!selectedFile || status === "uploading" || status === "processing"}
-              className="primary-button mt-5"
-            >
-              {status === "uploading" || status === "processing" ? "转写进行中..." : "开始转写"}
-            </button>
-
-            <div className="progress-card mt-5">
-              <div className="flex items-center justify-between text-sm">
-                <span className="font-medium text-slate-700">转写进度</span>
-                <span className="text-slate-500">{progress}%</span>
-              </div>
-              <div className="progress-track mt-3">
-                <div className="progress-fill" style={{ width: `${progress}%` }} />
-              </div>
-              <p className="mt-3 text-sm text-slate-500">
-                {jobId ? `任务 ID: ${jobId.slice(0, 8)}` : "创建任务后会持续显示上传与转写进度"}
-              </p>
-            </div>
-          </div>
-
-          <div className="panel-card">
-            <div className="panel-header">
-              <div>
-                <div className="panel-kicker">步骤 2</div>
-                <h2 className="panel-title">分段结果</h2>
-              </div>
-            </div>
-
-            <div className="segment-list">
-              {segments.length === 0 ? (
-                <div className="empty-state">
-                  <p className="text-base font-semibold text-slate-800">暂无转写内容</p>
-                  <p className="mt-2 text-sm text-slate-500">完成转写后，这里会显示带说话人和时间戳的逐段结果。</p>
+          {tasks.map((task) =>
+            task.status === "completed" ? (
+              <Link key={task.id} href={`/tasks/${task.id}`} className={`task-card task-status-${task.status}`}>
+                <div className="task-card-head">
+                  <span className="task-state-pill">{getStatusLabel(task.status)}</span>
+                  <span className="task-progress">{task.progress}%</span>
                 </div>
-              ) : (
-                segments.map((seg, idx) => (
-                  <article key={`${seg.start_ms}-${idx}`} className="segment-card">
-                    <div className="segment-meta">
-                      <span>{seg.speaker}</span>
-                      <span>
-                        {msToTime(seg.start_ms)} - {msToTime(seg.end_ms)}
-                      </span>
-                    </div>
-                    <p className="segment-text">{seg.text}</p>
-                  </article>
-                ))
-              )}
-            </div>
-          </div>
-        </section>
-
-        <section className="panel-card mt-6">
-          <div className="panel-header">
-            <div>
-              <div className="panel-kicker">步骤 3</div>
-              <h2 className="panel-title">Markdown 编辑器</h2>
-            </div>
-            <button onClick={exportMd} className="secondary-button" disabled={!markdown.trim()}>
-              导出 .md
-            </button>
-          </div>
-
-          <textarea
-            value={markdown}
-            onChange={(e) => setMarkdown(e.target.value)}
-            className="editor-area"
-            placeholder="转写完成后，这里会生成可继续编辑的 Markdown 内容。"
-          />
+                <div className="task-card-title">{task.title}</div>
+                <div className="task-card-meta">
+                  {task.fileName} · {formatFileSize(task.fileSize)}
+                </div>
+                <div className="task-card-footer">
+                  <span>{new Date(task.updatedAt).toLocaleString()}</span>
+                  <span>查看结果</span>
+                </div>
+              </Link>
+            ) : (
+              <article
+                key={task.id}
+                className={`task-card task-status-${task.status} ${task.status === "processing" || task.status === "uploading" ? "task-card-live" : ""}`}
+              >
+                <div className="task-card-head">
+                  <span className="task-state-pill">{getStatusLabel(task.status)}</span>
+                  <span className="task-progress">{task.progress}%</span>
+                </div>
+                <div className="task-card-title">{task.title}</div>
+                <div className="task-card-meta">
+                  {task.fileName} · {formatFileSize(task.fileSize)}
+                </div>
+                <div className="task-card-progress">
+                  <div className="task-card-progress-bar" style={{ width: `${task.progress}%` }} />
+                </div>
+                <div className="task-card-footer">
+                  <span>{task.statusText}</span>
+                  <span>{new Date(task.updatedAt).toLocaleTimeString()}</span>
+                </div>
+              </article>
+            )
+          )}
         </section>
       </div>
     </main>
