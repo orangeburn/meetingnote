@@ -7,6 +7,7 @@ export interface ModelStatus {
   downloadedBytes: number;
   error: string | null;
   isBackendOffline: boolean;
+  hasChecked: boolean;
 }
 
 const API_BASE = "http://127.0.0.1:8765";
@@ -19,6 +20,7 @@ export function useModelCheck(): ModelStatus {
     downloadedBytes: 0,
     error: null,
     isBackendOffline: true,
+    hasChecked: false,
   });
 
   useEffect(() => {
@@ -38,6 +40,7 @@ export function useModelCheck(): ModelStatus {
           downloadedBytes: data.downloaded_bytes || 0,
           needsDownload: !data.model_complete,
           isBackendOffline: false,
+          hasChecked: true,
           error: data.last_error || null
         }));
 
@@ -49,7 +52,7 @@ export function useModelCheck(): ModelStatus {
         }
       } catch (err: any) {
         if (!isCancelled) {
-          setStatus(prev => ({ ...prev, isBackendOffline: true }));
+          setStatus(prev => ({ ...prev, isBackendOffline: true, hasChecked: true }));
         }
       }
     };
@@ -84,6 +87,7 @@ export function useModelCheck(): ModelStatus {
             ...prev, 
             needsDownload: true, 
             isBackendOffline: false,
+            hasChecked: true,
             error: data.last_error || null 
           }));
           // If model is incomplete, proactively request download once.
@@ -99,12 +103,13 @@ export function useModelCheck(): ModelStatus {
             needsDownload: false, 
             isDownloading: false, 
             isBackendOffline: false,
+            hasChecked: true,
             error: null 
           }));
         }
       } catch (err: any) {
         if (!isCancelled) {
-          setStatus(prev => ({ ...prev, isBackendOffline: true }));
+          setStatus(prev => ({ ...prev, isBackendOffline: true, hasChecked: true }));
         }
       }
     };

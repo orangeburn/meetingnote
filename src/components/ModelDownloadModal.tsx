@@ -4,8 +4,13 @@ import React from "react";
 import { useModelCheck } from "../hooks/useModelCheck";
 
 export function ModelDownloadModal() {
-  const { needsDownload, isDownloading, downloadedBytes, error, isBackendOffline } = useModelCheck();
+  const { needsDownload, isDownloading, downloadedBytes, error, isBackendOffline, hasChecked } = useModelCheck();
   const errorText = typeof error === "string" ? error : error ? String(error) : "";
+
+  // 首轮状态未确认前不展示，避免首屏闪现。
+  if (!hasChecked) {
+    return null;
+  }
 
   // 只有在后端在线且不需要下载时才隐藏
   if (!isBackendOffline && !needsDownload) {

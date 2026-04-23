@@ -10,6 +10,7 @@ import tempfile
 import threading
 import uuid
 import faulthandler
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ if sys.platform == "win32":
 faulthandler.enable()
 
 from fastapi import FastAPI, File, UploadFile
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -80,6 +82,37 @@ def hidden_subprocess_kwargs(**kwargs: Any) -> dict[str, Any]:
         "creationflags": kwargs.get("creationflags", 0) | CREATE_NO_WINDOW,
         "startupinfo": STARTUPINFO,
     }
+
+
+def resolve_binary(binary_name: str) -> str:
+    """
+    Resolve to a real executable on Windows to avoid launching cmd/bat wrappers,
+    which can cause transient console flashes.
+    """
+    if sys.platform != "win32":
+        return shutil.which(binary_name) or binary_name
+
+    preferred = shutil.which(f"{binary_name}.exe") or shutil.which(binary_name)
+    if preferred and preferred.lower().endswith(".exe"):
+        return preferred
+
+    try:
+        completed = subprocess.run(
+            ["where", binary_name],
+            **hidden_subprocess_kwargs(capture_output=True, text=True, check=True),
+        )
+        for line in (completed.stdout or "").splitlines():
+            candidate = line.strip()
+            if candidate.lower().endswith(".exe"):
+                return candidate
+    except Exception:
+        pass
+
+    return preferred or binary_name
+
+
+FFMPEG_BIN = resolve_binary("ffmpeg")
+FFPROBE_BIN = resolve_binary("ffprobe")
 
 
 class TranscriptionJobStore:
@@ -230,6 +263,10 @@ class TranscriptionJobStore:
             return job.get("queue_position")
 
 
+class UpdateTranscriptionJobPayload(BaseModel):
+    markdown: str
+
+
 class AsrEngine:
     def __init__(self) -> None:
         self.model = None
@@ -237,8 +274,10 @@ class AsrEngine:
         self.ready = False
         self.model_path = ""
         self.last_error = ""
+        self.last_warning = ""
         self.is_downloading = False
         self.model_complete = False
+        self.diarization_supported = False
         self._init_model(auto_download=False)
 
     def check_model_complete(self, log_missing: bool = False) -> bool:
@@ -323,6 +362,8 @@ class AsrEngine:
                 )
                 self.model.eval()
                 self.ready = True
+                # Fun-ASR-Nano-2512 official repo implementation does not yet expose speaker diarization.
+                self.diarization_supported = False
                 self.model_path = str(MODEL_DIR)
                 print(f"[INFO] ASR Engine is ready with model: {MODEL_DIR}")
             else:
@@ -381,7 +422,7 @@ class AsrEngine:
 
     def _get_audio_duration_seconds(self, audio_path: Path) -> float:
         cmd = [
-            "ffprobe",
+            FFPROBE_BIN,
             "-v",
             "error",
             "-show_entries",
@@ -418,7 +459,7 @@ class AsrEngine:
             start_seconds = index * chunk_seconds
             chunk_path = chunk_dir / f"chunk_{index:03d}.wav"
             cmd = [
-                "ffmpeg",
+                FFMPEG_BIN,
                 "-y",
                 "-hide_banner",
                 "-loglevel",
@@ -543,6 +584,7 @@ class AsrEngine:
 
     def _normalize_result(self, result: Any) -> list[dict[str, Any]]:
         segments: list[dict[str, Any]] = []
+        has_explicit_speaker = False
         if not isinstance(result, list) or not result:
             return self._mock_segments()
         first = result[0]
@@ -559,7 +601,13 @@ class AsrEngine:
                 if not text:
                     continue
                 spk = item.get("spk")
-                speaker = f"Speaker {spk}" if spk is not None else "Speaker 1"
+                if spk is None:
+                    spk = item.get("speaker")
+                if spk is None:
+                    spk = item.get("speaker_id")
+                if spk is not None:
+                    has_explicit_speaker = True
+                speaker = f"Speaker {spk}" if spk is not None else "Speaker"
                 segments.append(
                     {
                         "speaker": speaker,
@@ -571,13 +619,21 @@ class AsrEngine:
 
         if not segments:
             text = str(first.get("text", "")).strip() or "(empty)"
-            segments = [{"speaker": "Speaker 1", "start_ms": 0, "end_ms": 5000, "text": text}]
+            segments = [{"speaker": "Speaker", "start_ms": 0, "end_ms": 5000, "text": text}]
+
+        self.last_warning = ""
+        if not has_explicit_speaker:
+            self.last_warning = (
+                "当前模型未返回说话人ID（speaker diarization 未生效），结果中的 Speaker 标签不区分具体说话人。"
+            )
         return merge_segments(segments)
 
 
 engine = AsrEngine()
 job_store = TranscriptionJobStore()
 job_queue: queue.Queue[tuple[str, Path]] = queue.Queue()
+print(f"[INFO] ffmpeg binary: {FFMPEG_BIN}")
+print(f"[INFO] ffprobe binary: {FFPROBE_BIN}")
 
 
 def render_markdown(segments: list[dict[str, Any]]) -> str:
@@ -585,7 +641,7 @@ def render_markdown(segments: list[dict[str, Any]]) -> str:
     for seg in segments:
         start = ms_to_hhmmss(seg["start_ms"])
         end = ms_to_hhmmss(seg["end_ms"])
-        lines.append(f"[{start} - {end}] [{seg['speaker']}]")
+        lines.append(f"[{start} - {end}]")
         lines.append(seg["text"])
         lines.append("")
     return "\n".join(lines)
@@ -656,7 +712,9 @@ def health() -> JSONResponse:
             "model_exists": MODEL_DIR.exists(),
             "model_complete": engine.model_complete,
             "is_downloading": engine.is_downloading,
+            "diarization_supported": engine.diarization_supported,
             "last_error": engine.last_error,
+            "last_warning": engine.last_warning,
         }
     )
 
@@ -705,7 +763,14 @@ async def transcribe(file: UploadFile = File(...)) -> JSONResponse:
     if not segments and engine.last_error:
         return JSONResponse({"segments": [], "markdown": "", "error": engine.last_error}, status_code=503)
     markdown = render_markdown(segments)
-    return JSONResponse({"segments": segments, "markdown": markdown})
+    return JSONResponse(
+        {
+            "segments": segments,
+            "markdown": markdown,
+            "warning": engine.last_warning,
+            "diarization_supported": engine.diarization_supported,
+        }
+    )
 
 
 def _run_transcription_job(job_id: str, tmp_path: Path) -> None:
@@ -738,11 +803,14 @@ def _run_transcription_job(job_id: str, tmp_path: Path) -> None:
             return
 
         markdown = render_markdown(segments)
+        final_message = "转写完成"
+        if engine.last_warning:
+            final_message = f"{final_message}（{engine.last_warning}）"
         job_store.update_job(
             job_id,
             status="completed",
             progress=100,
-            message="转写完成",
+            message=final_message,
             segments=segments,
             markdown=markdown,
             error="",
@@ -843,6 +911,17 @@ def get_transcription_job(job_id: str) -> JSONResponse:
 def list_transcription_jobs(limit: int = 100) -> JSONResponse:
     limit = max(1, min(limit, 500))
     return JSONResponse({"jobs": job_store.list_jobs(limit=limit)})
+
+
+@app.patch("/api/transcribe/jobs/{job_id}")
+def update_transcription_job(job_id: str, payload: UpdateTranscriptionJobPayload) -> JSONResponse:
+    job = job_store.get_job(job_id)
+    if job is None:
+        return JSONResponse({"error": "job not found"}, status_code=404)
+
+    job_store.update_job(job_id, markdown=payload.markdown)
+    updated_job = job_store.get_job(job_id)
+    return JSONResponse(updated_job)
 
 
 if __name__ == "__main__":

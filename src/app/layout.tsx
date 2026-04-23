@@ -1,8 +1,8 @@
 import "./globals.css";
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
+import { IBM_Plex_Sans } from "next/font/google";
 
-const inter = Inter({
+const bodyFont = IBM_Plex_Sans({
   subsets: ["latin"],
   weight: ["400", "500", "600", "700"],
   variable: "--font-body",
@@ -10,13 +10,13 @@ const inter = Inter({
 
 export const metadata: Metadata = {
   title: "MeetingNote",
-  description: "Meeting speech-to-text app"
+  description: "Meeting speech-to-text app",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="zh-CN">
-      <body className={inter.variable}>{children}</body>
+      <body className={`${bodyFont.variable}`}>{children}</body>
     </html>
   );
 }

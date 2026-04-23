@@ -25,12 +25,12 @@ export type TranscriptionTask = {
   error?: string;
 };
 
-const STORAGE_KEY = "meetingnote.tasks";
 const API_BASE = "http://127.0.0.1:8765";
 
 type ApiTask = {
   job_id: string;
   filename: string;
+  title?: string;
   status: JobStatus;
   progress: number;
   message: string;
@@ -40,6 +40,27 @@ type ApiTask = {
   created_at: string;
   updated_at?: string;
 };
+
+const TASK_TITLE_STORAGE_PREFIX = "meetingnote.task.title.";
+
+function getTaskTitleStorageKey(taskId: string) {
+  return `${TASK_TITLE_STORAGE_PREFIX}${taskId}`;
+}
+
+export function getTaskTitleOverride(taskId: string): string | null {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(getTaskTitleStorageKey(taskId));
+}
+
+export function setTaskTitleOverride(taskId: string, title: string) {
+  if (typeof window === "undefined") return;
+  const nextTitle = title.trim();
+  if (!nextTitle) {
+    window.localStorage.removeItem(getTaskTitleStorageKey(taskId));
+    return;
+  }
+  window.localStorage.setItem(getTaskTitleStorageKey(taskId), nextTitle);
+}
 
 export function msToTime(ms: number): string {
   const totalSec = Math.floor(ms / 1000);
@@ -58,11 +79,19 @@ export function msToTime(ms: number): string {
 export function renderMarkdown(segments: Segment[]): string {
   const lines: string[] = [];
   for (const seg of segments) {
-    lines.push(`[${msToTime(seg.start_ms)} - ${msToTime(seg.end_ms)}] [${seg.speaker}]`);
+    lines.push(`[${msToTime(seg.start_ms)} - ${msToTime(seg.end_ms)}]`);
     lines.push(seg.text || "");
     lines.push("");
   }
   return lines.join("\n");
+}
+
+export function stripTimestamps(markdown: string): string {
+  const lines = markdown.split(/\r?\n/);
+  const contentLines = lines.filter(
+    (line) => !/^\[\d{2}:\d{2}:\d{2}\s*-\s*\d{2}:\d{2}:\d{2}\]\s*$/.test(line.trim())
+  );
+  return contentLines.join("\n").trim();
 }
 
 export function formatFileSize(fileSize: number): string {
@@ -70,23 +99,6 @@ export function formatFileSize(fileSize: number): string {
     return `${Math.max(1, Math.round(fileSize / 1024))} KB`;
   }
   return `${(fileSize / 1024 / 1024).toFixed(1)} MB`;
-}
-
-export function loadTasks(): TranscriptionTask[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as TranscriptionTask[];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-export function saveTasks(tasks: TranscriptionTask[]) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
 }
 
 export function createTaskFromFile(file: File): TranscriptionTask {
@@ -111,19 +123,22 @@ export function createTaskFromFile(file: File): TranscriptionTask {
 export function normalizeTask(task: TranscriptionTask): TranscriptionTask {
   const normalizedId = task.jobId || task.id;
   const baseName = task.title || task.fileName.replace(/\.[^/.]+$/, "") || "未命名任务";
+  const titleOverride = getTaskTitleOverride(normalizedId);
   return {
     ...task,
     id: normalizedId,
-    title: baseName,
+    title: titleOverride || baseName,
   };
 }
 
 export function taskFromApi(task: ApiTask): TranscriptionTask {
   const fileName = task.filename || "未命名任务";
+  const baseTitle = task.title || fileName.replace(/\.[^/.]+$/, "") || "未命名任务";
+  const titleOverride = getTaskTitleOverride(task.job_id);
   return {
     id: task.job_id,
     jobId: task.job_id,
-    title: fileName.replace(/\.[^/.]+$/, "") || "未命名任务",
+    title: titleOverride || baseTitle,
     fileName,
     fileSize: 0,
     createdAt: task.created_at,
@@ -135,32 +150,6 @@ export function taskFromApi(task: ApiTask): TranscriptionTask {
     markdown: task.markdown || "",
     error: task.error,
   };
-}
-
-export function mergeTaskSources(localTasks: TranscriptionTask[], apiTasks: TranscriptionTask[]) {
-  const merged = new Map<string, TranscriptionTask>();
-
-  for (const task of localTasks.map(normalizeTask)) {
-    merged.set(task.jobId || task.id, task);
-  }
-
-  for (const task of apiTasks.map(normalizeTask)) {
-    const key = task.jobId || task.id;
-    const localTask = merged.get(key);
-    merged.set(
-      key,
-      localTask
-        ? {
-            ...localTask,
-            ...task,
-            fileSize: localTask.fileSize || task.fileSize,
-            markdown: localTask.markdown || task.markdown,
-          }
-        : task
-    );
-  }
-
-  return sortTasks([...merged.values()]);
 }
 
 export async function fetchTasksFromApi(): Promise<TranscriptionTask[]> {
@@ -182,6 +171,38 @@ export async function fetchTaskById(taskId: string): Promise<TranscriptionTask |
   return taskFromApi(data);
 }
 
+export async function updateTaskMarkdown(taskId: string, markdown: string): Promise<TranscriptionTask> {
+  const response = await fetch(`${API_BASE}/api/transcribe/jobs/${taskId}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ markdown }),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to update task: ${response.status}`);
+  }
+  const data = (await response.json()) as ApiTask;
+  return taskFromApi(data);
+}
+
+export async function updateTaskTitle(taskId: string, title: string): Promise<TranscriptionTask> {
+  const nextTitle = title.trim() || "未命名任务";
+  const response = await fetch(`${API_BASE}/api/transcribe/jobs/${taskId}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ title: nextTitle }),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to update task title: ${response.status}`);
+  }
+  const data = (await response.json()) as ApiTask;
+  setTaskTitleOverride(taskId, nextTitle);
+  return taskFromApi({ ...data, title: data.title || nextTitle });
+}
+
 export function updateTaskCollection(
   tasks: TranscriptionTask[],
   taskId: string,
@@ -191,5 +212,13 @@ export function updateTaskCollection(
 }
 
 export function sortTasks(tasks: TranscriptionTask[]) {
-  return [...tasks].sort((a, b) => +new Date(b.updatedAt) - +new Date(a.updatedAt));
+  return [...tasks].sort((a, b) => {
+    const byCreatedAt = +new Date(b.createdAt) - +new Date(a.createdAt);
+    if (byCreatedAt !== 0) return byCreatedAt;
+
+    const byUpdatedAt = +new Date(b.updatedAt) - +new Date(a.updatedAt);
+    if (byUpdatedAt !== 0) return byUpdatedAt;
+
+    return b.id.localeCompare(a.id);
+  });
 }
