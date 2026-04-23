@@ -28,6 +28,12 @@
       "electron/**/*",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "services/asr_server",
+        "to": "services/asr_server"
+      }
+    ],
     "directories": {
       "buildResources": "build"
     },

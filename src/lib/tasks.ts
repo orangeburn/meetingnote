@@ -7,7 +7,17 @@ export type Segment = {
   text: string;
 };
 
-export type JobStatus = "idle" | "uploading" | "queued" | "processing" | "completed" | "failed";
+export type JobStatus =
+  | "idle"
+  | "uploading"
+  | "queued"
+  | "processing"
+  | "pausing"
+  | "resuming"
+  | "completed"
+  | "failed"
+  | "paused"
+  | "cancelled";
 
 export type TranscriptionTask = {
   id: string;
@@ -212,7 +222,20 @@ export function updateTaskCollection(
 }
 
 export function sortTasks(tasks: TranscriptionTask[]) {
-  return [...tasks].sort((a, b) => {
+  const deduped = new Map<string, TranscriptionTask>();
+  for (const task of tasks) {
+    const existing = deduped.get(task.id);
+    if (!existing) {
+      deduped.set(task.id, task);
+      continue;
+    }
+
+    const existingUpdatedAt = +new Date(existing.updatedAt || existing.createdAt);
+    const nextUpdatedAt = +new Date(task.updatedAt || task.createdAt);
+    deduped.set(task.id, nextUpdatedAt >= existingUpdatedAt ? task : existing);
+  }
+
+  return [...deduped.values()].sort((a, b) => {
     const byCreatedAt = +new Date(b.createdAt) - +new Date(a.createdAt);
     if (byCreatedAt !== 0) return byCreatedAt;
 
@@ -221,4 +244,34 @@ export function sortTasks(tasks: TranscriptionTask[]) {
 
     return b.id.localeCompare(a.id);
   });
+}
+
+export async function pauseTask(taskId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/transcribe/jobs/${taskId}/pause`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to pause task: ${response.status}`);
+  }
+}
+
+export async function cancelTask(taskId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/transcribe/jobs/${taskId}/cancel`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to cancel task: ${response.status}`);
+  }
+}
+
+export async function resumeTask(taskId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/transcribe/jobs/${taskId}/resume`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `Failed to resume task: ${response.status}`);
+  }
 }

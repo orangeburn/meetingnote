@@ -15,6 +15,9 @@ import {
   updateTaskMarkdown,
   updateTaskTitle,
   updateTaskCollection,
+  pauseTask,
+  cancelTask,
+  resumeTask,
   type JobStatus,
   type Segment,
   type TranscriptionTask,
@@ -22,18 +25,134 @@ import {
 
 const API_BASE = "http://127.0.0.1:8765";
 
+function TaskActionIcon({ kind }: { kind: "pause" | "cancel" | "resume" | "retry" }) {
+  if (kind === "pause") {
+    return (
+      <svg viewBox="0 0 16 16" aria-hidden="true" className="task-action-icon">
+        <rect x="4" y="3" width="3" height="10" rx="1" fill="currentColor" />
+        <rect x="9" y="3" width="3" height="10" rx="1" fill="currentColor" />
+      </svg>
+    );
+  }
+  if (kind === "cancel") {
+    return (
+      <svg viewBox="0 0 16 16" aria-hidden="true" className="task-action-icon">
+        <path
+          d="M4.5 4.5L11.5 11.5M11.5 4.5L4.5 11.5"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.7"
+          strokeLinecap="round"
+        />
+      </svg>
+    );
+  }
+  if (kind === "resume") {
+    return (
+      <svg viewBox="0 0 16 16" aria-hidden="true" className="task-action-icon">
+        <path d="M5 3.5L12 8L5 12.5V3.5Z" fill="currentColor" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true" className="task-action-icon">
+      <path
+        d="M12.5 8A4.5 4.5 0 1 1 8 3.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+      />
+      <path
+        d="M8 1.75H12.25V6"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 export default function HomePage() {
   const [tasks, setTasks] = useState<TranscriptionTask[]>([]);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const activeTaskIdRef = useRef<string | null>(null);
   const manualPollingRef = useRef(false);
-  const queuedFilesRef = useRef<File[]>([]);
+  const tasksRef = useRef<TranscriptionTask[]>([]);
+  const queuedFilesRef = useRef<Array<{ file: File; taskId: string }>>([]);
   const processingQueueRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [editorDrafts, setEditorDrafts] = useState<Record<string, string>>({});
   const [titleDrafts, setTitleDrafts] = useState<Record<string, string>>({});
   const [savingTitleTaskId, setSavingTitleTaskId] = useState<string | null>(null);
+  const autoRetryRef = useRef<Map<string, number>>(new Map());
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+
+  function hasActiveRemoteTask(taskList: TranscriptionTask[]) {
+    return taskList.some(
+      (task) =>
+        Boolean(task.jobId) &&
+        (
+          task.status === "uploading" ||
+          task.status === "queued" ||
+          task.status === "processing" ||
+          task.status === "pausing" ||
+          task.status === "resuming"
+        )
+    );
+  }
+
+  function stopPolling(taskId?: string | null) {
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
+    }
+    if (!taskId || activeTaskIdRef.current === taskId) {
+      activeTaskIdRef.current = null;
+    }
+  }
+
+  function startPolling(taskId: string, jobId: string) {
+    stopPolling(taskId);
+    activeTaskIdRef.current = taskId;
+    pollingRef.current = setInterval(() => {
+      void pollJob(taskId, jobId);
+    }, 800);
+  }
+
+  function applyTaskOptimisticUpdate(taskId: string, updater: (task: TranscriptionTask) => TranscriptionTask) {
+    setTasks((current) => sortTasks(updateTaskCollection(current, taskId, updater)));
+  }
+
+  function mergeTaskWithRemoteState(localTask: TranscriptionTask, remoteTask: TranscriptionTask): TranscriptionTask {
+    const keepPausing =
+      localTask.status === "pausing" &&
+      (remoteTask.status === "processing" || remoteTask.status === "queued");
+    const keepResuming =
+      localTask.status === "resuming" &&
+      (remoteTask.status === "paused" || remoteTask.status === "queued");
+
+    if (keepPausing) {
+      return {
+        ...remoteTask,
+        status: "pausing",
+        statusText: "暂停中，将在当前片段处理完成后停止",
+      };
+    }
+
+    if (keepResuming) {
+      return {
+        ...remoteTask,
+        status: "resuming",
+        statusText: "重启中，正在恢复任务处理",
+      };
+    }
+
+    return remoteTask;
+  }
 
   function exportTextWithoutTimestamps(markdown: string, fileName: string) {
     const content = stripTimestamps(markdown);
@@ -49,7 +168,19 @@ export default function HomePage() {
   async function syncTasksFromApi() {
     try {
       const apiTasks = await fetchTasksFromApi();
-      setTasks(sortTasks(apiTasks.map(normalizeTask)));
+      setTasks((current) => {
+        const normalizedApiTasks = apiTasks.map(normalizeTask);
+        const currentById = new Map(current.map((task) => [task.id, task]));
+        const mergedApiTasks = normalizedApiTasks.map((task) => {
+          const localTask = currentById.get(task.id);
+          return localTask ? mergeTaskWithRemoteState(localTask, task) : task;
+        });
+        const apiIds = new Set(mergedApiTasks.map((task) => task.id));
+        const localPending = current.filter(
+          (task) => !apiIds.has(task.id) && !task.jobId && (task.status === "queued" || task.status === "uploading")
+        );
+        return sortTasks([...mergedApiTasks, ...localPending]);
+      });
     } catch {
       setTasks((current) => current);
     }
@@ -80,10 +211,20 @@ export default function HomePage() {
   }, []);
 
   useEffect(() => {
+    tasksRef.current = tasks;
+  }, [tasks]);
+
+  useEffect(() => {
     const resumableTask = tasks.find(
       (task) =>
         task.jobId &&
-        (task.status === "uploading" || task.status === "queued" || task.status === "processing")
+        (
+          task.status === "uploading" ||
+          task.status === "queued" ||
+          task.status === "processing" ||
+          task.status === "pausing" ||
+          task.status === "resuming"
+        )
     );
 
     if (
@@ -107,12 +248,20 @@ export default function HomePage() {
     }, 800);
 
     return () => {
-      if (pollingRef.current && activeTaskIdRef.current === resumableTask.id) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
-        activeTaskIdRef.current = null;
+      if (activeTaskIdRef.current === resumableTask.id) {
+        stopPolling(resumableTask.id);
       }
     };
+  }, [tasks]);
+
+  useEffect(() => {
+    if (queuedFilesRef.current.length === 0) {
+      return;
+    }
+    if (hasActiveRemoteTask(tasks)) {
+      return;
+    }
+    void processFileQueue();
   }, [tasks]);
 
   useEffect(() => {
@@ -126,9 +275,7 @@ export default function HomePage() {
   }, [tasks, activeTaskId]);
   useEffect(() => {
     return () => {
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current);
-      }
+      stopPolling();
     };
   }, []);
 
@@ -143,26 +290,73 @@ export default function HomePage() {
 
       setTasks((current) =>
         sortTasks(
-          updateTaskCollection(current, taskId, (task) => ({
-            ...task,
-            status: nextStatus,
-            progress: nextProgress,
-            statusText: nextStatus === "failed" ? data.error || nextStatusText : nextStatusText,
-            segments: nextSegments.length > 0 ? nextSegments : task.segments,
-            markdown:
-              nextSegments.length > 0 ? data.markdown || renderMarkdown(nextSegments) : task.markdown,
-            updatedAt: new Date().toISOString(),
-            error: nextStatus === "failed" ? data.error || nextStatusText : undefined,
-          }))
+          updateTaskCollection(current, taskId, (task) => {
+            const shouldKeepPausing = task.status === "pausing" && nextStatus === "processing";
+            const shouldKeepResuming =
+              task.status === "resuming" && (nextStatus === "paused" || nextStatus === "queued");
+            return {
+              ...task,
+              status: shouldKeepPausing ? "pausing" : shouldKeepResuming ? "resuming" : nextStatus,
+              progress: nextProgress,
+              statusText:
+                shouldKeepPausing
+                  ? "暂停中，将在当前片段处理完成后停止"
+                  : shouldKeepResuming
+                    ? "重启中，正在恢复任务处理"
+                    : nextStatus === "failed"
+                      ? data.error || nextStatusText
+                      : nextStatusText,
+              segments: nextSegments.length > 0 ? nextSegments : task.segments,
+              markdown:
+                nextSegments.length > 0 ? data.markdown || renderMarkdown(nextSegments) : task.markdown,
+              updatedAt: new Date().toISOString(),
+              error: nextStatus === "failed" ? data.error || nextStatusText : undefined,
+            };
+          })
         )
       );
 
-      if (nextStatus === "completed" || nextStatus === "failed") {
-        if (pollingRef.current) {
-          clearInterval(pollingRef.current);
-          pollingRef.current = null;
+      // Auto-retry: only for "failed" status, not for paused/cancelled.
+      if (nextStatus === "failed") {
+        const previousAttempts = autoRetryRef.current.get(nextJobId) ?? 0;
+        if (previousAttempts < 2) {
+          autoRetryRef.current.set(nextJobId, previousAttempts + 1);
+          setTasks((current) =>
+            sortTasks(
+              updateTaskCollection(current, taskId, (task) => ({
+                ...task,
+                status: "queued",
+                statusText: `失败，自动重试中（${previousAttempts + 1}/2）`,
+                progress: 0,
+                updatedAt: new Date().toISOString(),
+              }))
+            )
+          );
+          try {
+            await resumeTask(nextJobId);
+            return "queued";
+          } catch (retryError: any) {
+            setTasks((current) =>
+              sortTasks(
+                updateTaskCollection(current, taskId, (task) => ({
+                  ...task,
+                  status: "failed",
+                  statusText:
+                    retryError?.message || "自动重试失败",
+                  error: retryError?.message || "自动重试失败",
+                  updatedAt: new Date().toISOString(),
+                }))
+              )
+            );
+            return "failed";
+          }
         }
-        activeTaskIdRef.current = null;
+      }
+
+      // Terminal states: stop polling.
+      const terminalStates: JobStatus[] = ["completed", "failed", "paused", "cancelled"];
+      if (terminalStates.includes(nextStatus)) {
+        stopPolling(taskId);
       }
       return nextStatus;
     } catch (error: any) {
@@ -177,24 +371,26 @@ export default function HomePage() {
           }))
         )
       );
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current);
-        pollingRef.current = null;
-      }
-      activeTaskIdRef.current = null;
+      stopPolling(taskId);
       return "failed";
     }
   }
 
-  async function transcribeFile(file: File) {
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current);
-      pollingRef.current = null;
-    }
-
-    const nextTask = createTaskFromFile(file);
-    activeTaskIdRef.current = nextTask.id;
-    setTasks((current) => sortTasks([normalizeTask(nextTask), ...current]));
+  async function transcribeFile(item: { file: File; taskId: string }) {
+    const file = item.file;
+    const taskId = item.taskId;
+    stopPolling(taskId);
+    activeTaskIdRef.current = taskId;
+    setTasks((current) => {
+      if (current.some((task) => task.id === taskId)) return current;
+      const fallbackTask = normalizeTask({
+        ...createTaskFromFile(file),
+        id: taskId,
+        status: "queued",
+        statusText: "等待中",
+      });
+      return sortTasks([fallbackTask, ...current]);
+    });
 
     const form = new FormData();
     form.append("file", file);
@@ -207,7 +403,7 @@ export default function HomePage() {
           const uploadPercent = Math.min(25, Math.round((event.loaded / event.total) * 25));
           setTasks((current) =>
             sortTasks(
-              updateTaskCollection(current, nextTask.id, (task) => ({
+              updateTaskCollection(current, taskId, (task) => ({
                 ...task,
                 status: "uploading",
                 progress: uploadPercent,
@@ -221,7 +417,7 @@ export default function HomePage() {
 
       const nextJobId = resp.data?.job_id as string;
       setTasks((current) => {
-        const taskIndex = current.findIndex((task) => task.id === nextTask.id);
+        const taskIndex = current.findIndex((task) => task.id === taskId);
         if (taskIndex === -1) return current;
         const nextTasks = [...current];
         nextTasks[taskIndex] = {
@@ -239,7 +435,7 @@ export default function HomePage() {
       manualPollingRef.current = true;
       while (true) {
         const status = await pollJob(nextJobId, nextJobId);
-        if (status === "completed" || status === "failed") {
+        if (["completed", "failed", "paused", "cancelled"].includes(status)) {
           break;
         }
         await new Promise((resolve) => setTimeout(resolve, 800));
@@ -248,29 +444,33 @@ export default function HomePage() {
     } catch (error: any) {
       setTasks((current) =>
         sortTasks(
-          updateTaskCollection(current, nextTask.id, (task) => ({
+          updateTaskCollection(current, taskId, (task) => ({
             ...task,
             status: "failed",
-            progress: 100,
+            progress: task.progress,
             statusText: error?.response?.data?.error || error?.message || "转写失败",
             error: error?.response?.data?.error || error?.message || "转写失败",
             updatedAt: new Date().toISOString(),
           }))
         )
       );
-      activeTaskIdRef.current = null;
+      stopPolling(taskId);
       manualPollingRef.current = false;
     }
   }
 
   async function processFileQueue() {
     if (processingQueueRef.current) return;
+    if (hasActiveRemoteTask(tasksRef.current)) return;
     processingQueueRef.current = true;
     try {
       while (queuedFilesRef.current.length > 0) {
-        const nextFile = queuedFilesRef.current.shift();
-        if (!nextFile) break;
-        await transcribeFile(nextFile);
+        if (hasActiveRemoteTask(tasksRef.current)) {
+          break;
+        }
+        const nextItem = queuedFilesRef.current.shift();
+        if (!nextItem) break;
+        await transcribeFile(nextItem);
       }
     } finally {
       processingQueueRef.current = false;
@@ -278,8 +478,30 @@ export default function HomePage() {
   }
 
   function enqueueFile(file: File) {
-    queuedFilesRef.current.push(file);
-    void processFileQueue();
+    const nextTask = normalizeTask({
+      ...createTaskFromFile(file),
+      status: "queued",
+      statusText: "等待中",
+    });
+    setTasks((current) => sortTasks([nextTask, ...current]));
+    setActiveTaskId(nextTask.id);
+    queuedFilesRef.current.push({ file, taskId: nextTask.id });
+    setTasks((current) => {
+      if (hasActiveRemoteTask(current)) {
+        return sortTasks(
+          updateTaskCollection(current, nextTask.id, (task) => ({
+            ...task,
+            status: "queued",
+            statusText: "等待当前任务完成后开始上传",
+            updatedAt: new Date().toISOString(),
+          }))
+        );
+      }
+      return current;
+    });
+    if (!hasActiveRemoteTask(tasks)) {
+      void processFileQueue();
+    }
   }
 
   async function saveTaskTitle(task: TranscriptionTask, rawTitle: string) {
@@ -320,13 +542,30 @@ export default function HomePage() {
   function getStatusLabel(status: JobStatus) {
     if (status === "uploading") return "上传中";
     if (status === "processing") return "转录中";
+    if (status === "pausing") return "暂停中";
+    if (status === "resuming") return "重启中";
     if (status === "queued") return "等待中";
     if (status === "completed") return "已完成";
     if (status === "failed") return "失败";
+    if (status === "paused") return "已暂停";
+    if (status === "cancelled") return "已取消";
     return "待开始";
   }
 
   function renderStatusIndicator(status: JobStatus) {
+    if (status === "uploading") {
+      return (
+        <span
+          className="task-state-pill task-state-pill-icon task-state-pill-uploading"
+          title="上传中"
+          aria-label="上传中"
+        >
+          <span className="task-state-upload-icon" aria-hidden="true">
+            ↑
+          </span>
+        </span>
+      );
+    }
     if (status === "processing") {
       return (
         <span className="task-state-pill task-state-pill-icon" title="转录中" aria-label="转录中">
@@ -334,6 +573,33 @@ export default function HomePage() {
             <span />
             <span />
             <span />
+            <span />
+          </span>
+        </span>
+      );
+    }
+    if (status === "pausing") {
+      return (
+        <span
+          className="task-state-pill task-state-pill-icon task-state-pill-pausing"
+          title="暂停中"
+          aria-label="暂停中"
+        >
+          <span className="task-state-pausing-icon" aria-hidden="true">
+            <span />
+            <span />
+          </span>
+        </span>
+      );
+    }
+    if (status === "resuming") {
+      return (
+        <span
+          className="task-state-pill task-state-pill-icon task-state-pill-resuming"
+          title="重启中"
+          aria-label="重启中"
+        >
+          <span className="task-state-resuming-icon" aria-hidden="true">
             <span />
           </span>
         </span>
@@ -367,7 +633,59 @@ export default function HomePage() {
         </span>
       );
     }
+    if (status === "failed") {
+      return (
+        <span
+          className="task-state-pill task-state-pill-icon task-state-pill-failed"
+          title="失败"
+          aria-label="失败"
+        >
+          <span className="task-state-failed-icon" aria-hidden="true">
+            ×
+          </span>
+        </span>
+      );
+    }
+    if (status === "paused") {
+      return (
+        <span
+          className="task-state-pill task-state-pill-icon task-state-pill-paused"
+          title="已暂停"
+          aria-label="已暂停"
+        >
+          <span className="task-state-paused-icon" aria-hidden="true">
+            ⏸
+          </span>
+        </span>
+      );
+    }
+    if (status === "cancelled") {
+      return (
+        <span
+          className="task-state-pill task-state-pill-icon task-state-pill-cancelled"
+          title="已取消"
+          aria-label="已取消"
+        >
+          <span className="task-state-cancelled-icon" aria-hidden="true">
+            ○
+          </span>
+        </span>
+      );
+    }
     return <span className="task-state-pill">{getStatusLabel(status)}</span>;
+  }
+
+  function renderQueuedInlineLabel() {
+    return (
+      <span className="task-status-inline" aria-label="等待中">
+        <span>等待中</span>
+        <span className="task-state-waiting" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </span>
+      </span>
+    );
   }
 
   const activeTask = useMemo(
@@ -387,7 +705,7 @@ export default function HomePage() {
       <PageContainer className="py-4">
         <header className="saas-header-floating">
           <div className="saas-header-left">
-            <h1 className="saas-header-title">转录控制台</h1>
+            <h1 className="saas-header-title">MeetingNote</h1>
           </div>
         </header>
 
@@ -427,7 +745,9 @@ export default function HomePage() {
                     <span>
                       {task.status === "completed"
                         ? `创建于 ${new Date(task.createdAt).toLocaleString()}`
-                        : task.statusText}
+                        : task.status === "queued"
+                          ? renderQueuedInlineLabel()
+                          : task.statusText}
                     </span>
                     <span>{task.progress}%</span>
                   </div>
@@ -463,7 +783,7 @@ export default function HomePage() {
                       {`${activeTask.fileName} · 创建于 ${new Date(activeTask.createdAt).toLocaleString()}`}
                     </p>
                   </div>
-                  <div className="ds-section-actions">
+                  <div className="ds-section-actions task-actions-bar">
                     {isTitleDirty ? (
                       <Button
                         tone="secondary"
@@ -476,6 +796,215 @@ export default function HomePage() {
                         {savingTitleTaskId === activeTask.id ? "保存中..." : "保存 ↵"}
                       </Button>
                     ) : null}
+
+                    {/* Task control actions – context-dependent */}
+                    {(activeTask.status === "processing" || activeTask.status === "pausing") && (
+                      <>
+                        <Button
+                          tone="secondary"
+                          size="sm"
+                          disabled={actionLoading === activeTask.id || activeTask.status === "pausing"}
+                          onClick={async () => {
+                            setActionLoading(activeTask.id);
+                            try {
+                              applyTaskOptimisticUpdate(activeTask.id, (task) => ({
+                                ...task,
+                                status: "pausing",
+                                statusText: "暂停中，将在当前片段处理完成后停止",
+                                updatedAt: new Date().toISOString(),
+                              }));
+                              await pauseTask(activeTask.id);
+                              startPolling(activeTask.id, activeTask.id);
+                            } catch {
+                              void syncTasksFromApi();
+                            } finally {
+                              setActionLoading(null);
+                            }
+                          }}
+                        >
+                          <TaskActionIcon kind="pause" />
+                          <span>{activeTask.status === "pausing" ? "暂停中..." : "暂停"}</span>
+                        </Button>
+                        <Button
+                          tone="ghost"
+                          size="sm"
+                          disabled={actionLoading === activeTask.id || activeTask.status === "pausing"}
+                          onClick={async () => {
+                            setActionLoading(activeTask.id);
+                            try {
+                              applyTaskOptimisticUpdate(activeTask.id, (task) => ({
+                                ...task,
+                                status: "cancelled",
+                                progress: 0,
+                                statusText:
+                                  task.status === "pausing" ? "正在取消暂停中的任务..." : "正在取消...",
+                                updatedAt: new Date().toISOString(),
+                              }));
+                              stopPolling(activeTask.id);
+                              await cancelTask(activeTask.id);
+                              void syncTasksFromApi();
+                            } catch {
+                              void syncTasksFromApi();
+                            } finally {
+                              setActionLoading(null);
+                            }
+                          }}
+                        >
+                          <TaskActionIcon kind="cancel" />
+                          <span>取消</span>
+                        </Button>
+                      </>
+                    )}
+                    {(activeTask.status === "queued" || activeTask.status === "resuming") && (
+                      <Button
+                        tone="ghost"
+                        size="sm"
+                        disabled={actionLoading === activeTask.id || activeTask.status === "resuming"}
+                        onClick={async () => {
+                          setActionLoading(activeTask.id);
+                          try {
+                            applyTaskOptimisticUpdate(activeTask.id, (task) => ({
+                              ...task,
+                              status: "cancelled",
+                              progress: 0,
+                              statusText: task.status === "resuming" ? "正在取消重启中的任务..." : "正在取消...",
+                              updatedAt: new Date().toISOString(),
+                            }));
+                            stopPolling(activeTask.id);
+                            await cancelTask(activeTask.id);
+                            void syncTasksFromApi();
+                          } catch {
+                            void syncTasksFromApi();
+                          } finally {
+                            setActionLoading(null);
+                          }
+                        }}
+                      >
+                        <TaskActionIcon kind="cancel" />
+                        <span>取消</span>
+                      </Button>
+                    )}
+                    {activeTask.status === "paused" && (
+                      <>
+                        <Button
+                          tone="secondary"
+                          size="sm"
+                          disabled={actionLoading === activeTask.id}
+                          onClick={async () => {
+                            setActionLoading(activeTask.id);
+                            try {
+                              applyTaskOptimisticUpdate(activeTask.id, (task) => ({
+                                ...task,
+                                status: "resuming",
+                                progress: 0,
+                                statusText: "重启中，正在恢复任务处理",
+                                updatedAt: new Date().toISOString(),
+                              }));
+                              await resumeTask(activeTask.id);
+                              startPolling(activeTask.id, activeTask.id);
+                              void syncTasksFromApi();
+                            } catch {
+                              void syncTasksFromApi();
+                            } finally {
+                              setActionLoading(null);
+                            }
+                          }}
+                        >
+                          <TaskActionIcon kind="resume" />
+                          <span>继续</span>
+                        </Button>
+                        <Button
+                          tone="ghost"
+                          size="sm"
+                          disabled={actionLoading === activeTask.id}
+                          onClick={async () => {
+                            setActionLoading(activeTask.id);
+                            try {
+                              applyTaskOptimisticUpdate(activeTask.id, (task) => ({
+                                ...task,
+                                status: "cancelled",
+                                progress: 0,
+                                statusText: "正在取消...",
+                                updatedAt: new Date().toISOString(),
+                              }));
+                              stopPolling(activeTask.id);
+                              await cancelTask(activeTask.id);
+                              void syncTasksFromApi();
+                            } catch {
+                              void syncTasksFromApi();
+                            } finally {
+                              setActionLoading(null);
+                            }
+                          }}
+                        >
+                          <TaskActionIcon kind="cancel" />
+                          <span>取消</span>
+                        </Button>
+                      </>
+                    )}
+                    {activeTask.status === "failed" && (
+                      <Button
+                        tone="secondary"
+                        size="sm"
+                        disabled={actionLoading === activeTask.id}
+                        onClick={async () => {
+                          setActionLoading(activeTask.id);
+                          try {
+                            autoRetryRef.current.delete(activeTask.id);
+                            applyTaskOptimisticUpdate(activeTask.id, (task) => ({
+                              ...task,
+                              status: "queued",
+                              progress: 0,
+                              error: undefined,
+                              statusText: "正在重新排队...",
+                              updatedAt: new Date().toISOString(),
+                            }));
+                            await resumeTask(activeTask.id);
+                            startPolling(activeTask.id, activeTask.id);
+                            void syncTasksFromApi();
+                          } catch {
+                            void syncTasksFromApi();
+                          } finally {
+                            setActionLoading(null);
+                          }
+                        }}
+                      >
+                        <TaskActionIcon kind="retry" />
+                        <span>重试</span>
+                      </Button>
+                    )}
+                    {activeTask.status === "cancelled" && (
+                      <Button
+                        tone="secondary"
+                        size="sm"
+                        disabled={actionLoading === activeTask.id}
+                        onClick={async () => {
+                          setActionLoading(activeTask.id);
+                          try {
+                            autoRetryRef.current.delete(activeTask.id);
+                            applyTaskOptimisticUpdate(activeTask.id, (task) => ({
+                              ...task,
+                              status: "queued",
+                              progress: 0,
+                              error: undefined,
+                              statusText: "正在重新开始...",
+                              updatedAt: new Date().toISOString(),
+                            }));
+                            await resumeTask(activeTask.id);
+                            startPolling(activeTask.id, activeTask.id);
+                            void syncTasksFromApi();
+                          } catch {
+                            void syncTasksFromApi();
+                          } finally {
+                            setActionLoading(null);
+                          }
+                        }}
+                      >
+                        <TaskActionIcon kind="retry" />
+                        <span>重新开始</span>
+                      </Button>
+                    )}
+
                     <span className="task-state-pill">{activeTask.progress}%</span>
                   </div>
                 </header>

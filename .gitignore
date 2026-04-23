@@ -9,3 +9,5 @@ __pycache__
 *.pyc
 scratch/
 services/asr_server/models/
+services/asr_server/vendor/ffmpeg/win32/ffmpeg.exe
+services/asr_server/vendor/ffmpeg/win32/ffprobe.exe
