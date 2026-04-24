@@ -4,7 +4,16 @@ import React from "react";
 import { useModelCheck } from "../hooks/useModelCheck";
 
 export function ModelDownloadModal() {
-  const { needsDownload, isDownloading, downloadedBytes, error, isBackendOffline, hasChecked } = useModelCheck();
+  const {
+    isReady,
+    needsDownload,
+    isDownloading,
+    isInitializing,
+    downloadedBytes,
+    error,
+    isBackendOffline,
+    hasChecked,
+  } = useModelCheck();
   const errorText = typeof error === "string" ? error : error ? String(error) : "";
 
   // 首轮状态未确认前不展示，避免首屏闪现。
@@ -12,8 +21,8 @@ export function ModelDownloadModal() {
     return null;
   }
 
-  // 只有在后端在线且不需要下载时才隐藏
-  if (!isBackendOffline && !needsDownload) {
+  // 只有模型真正可用后才隐藏；仅“文件已下载完成”仍要继续显示加载状态
+  if (!isBackendOffline && isReady) {
     return null;
   }
 
@@ -48,7 +57,7 @@ export function ModelDownloadModal() {
       ) : (
         <div className="mt-4">
           <p className="model-status-copy">
-            正在准备语音模型，完成后可直接上传音频。
+            {needsDownload ? "正在下载语音模型，完成后可直接上传音频。" : "正在加载语音模型，完成后可直接上传音频。"}
           </p>
           <div className="mt-4 flex flex-col gap-3">
             <div className="relative h-2 w-full overflow-hidden rounded-full bg-slate-100">
@@ -56,7 +65,13 @@ export function ModelDownloadModal() {
             </div>
 
             <div className="text-sm font-medium text-slate-700">
-              {isDownloading ? `正在下载模型... 已缓存 ${downloadedMB} MB` : "准备下载中..."}
+              {isDownloading
+                ? `正在下载模型... 已缓存 ${downloadedMB} MB`
+                : isInitializing
+                  ? "正在加载模型..."
+                  : needsDownload
+                    ? "准备下载模型..."
+                    : "准备加载模型..."}
             </div>
           </div>
         </div>

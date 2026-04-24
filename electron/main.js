@@ -6,6 +6,7 @@ const path = require("path");
 
 let mainWindow;
 let asrProcess;
+let webProcess;
 const ASR_PORT = 8765;
 const ASR_HEALTH_URL = `http://127.0.0.1:${ASR_PORT}/health`;
 const APP_URL = "http://localhost:3000";
@@ -14,6 +15,10 @@ function getAppRootDir() {
   // In packaged apps, extraResources are placed under process.resourcesPath.
   // In dev, __dirname is electron/ so we go one level up to the repo root.
   return app.isPackaged ? process.resourcesPath : path.join(__dirname, "..");
+}
+
+function getPackagedAppDir() {
+  return app.isPackaged ? app.getAppPath() : path.join(__dirname, "..");
 }
 
 function getAsrLogPaths() {
@@ -129,6 +134,60 @@ function waitForUrl(url, timeoutMs = 800) {
   });
 }
 
+function getWebLogPaths() {
+  const logDir = app.getPath("userData");
+  return {
+    stdout: path.join(logDir, "web-server.log"),
+    stderr: path.join(logDir, "web-server.err.log")
+  };
+}
+
+async function startBundledWebServer() {
+  if (!app.isPackaged) {
+    return;
+  }
+
+  const alreadyRunning = await waitForUrl(APP_URL, 1000);
+  if (alreadyRunning) {
+    console.log(`[WEB] Reusing existing web server on ${APP_URL}`);
+    return;
+  }
+
+  const serverScriptPath = path.join(getPackagedAppDir(), ".next", "standalone", "server.js");
+  if (!fs.existsSync(serverScriptPath)) {
+    throw new Error(`Packaged Next server not found: ${serverScriptPath}`);
+  }
+
+  const logPaths = getWebLogPaths();
+  const stdoutFd = fs.openSync(logPaths.stdout, "a");
+  const stderrFd = fs.openSync(logPaths.stderr, "a");
+  console.log(`[WEB] Launching bundled web server: ${serverScriptPath}`);
+  console.log(`[WEB] Logs: ${logPaths.stdout}`);
+
+  webProcess = spawn(process.execPath, [serverScriptPath], {
+    stdio: ["ignore", stdoutFd, stderrFd],
+    shell: false,
+    windowsHide: true,
+    detached: false,
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: "1",
+      HOSTNAME: "127.0.0.1",
+      PORT: "3000",
+      NODE_ENV: "production"
+    }
+  });
+
+  webProcess.on("error", (error) => {
+    console.error("[WEB] Failed to start bundled web server:", error);
+  });
+
+  webProcess.on("close", (code) => {
+    console.log(`[WEB] Bundled web server exited with code ${code}`);
+    webProcess = null;
+  });
+}
+
 function buildSplashHtml() {
   return `<!doctype html>
   <html lang="zh-CN">
@@ -226,10 +285,10 @@ function buildSplashHtml() {
       <main class="shell">
         <p class="eyebrow">MeetingNote</p>
         <h1>正在启动应用</h1>
-        <p>正在载入应用界面与本地数据，请稍等片刻。</p>
+        <p>正在载入应用界面、任务数据与语音服务，请稍等片刻。</p>
         <div class="row">
           <div class="spinner" aria-hidden="true"></div>
-          <strong>正在连接前端页面…</strong>
+          <strong>正在准备首页和本地任务数据…</strong>
         </div>
         <div class="bar"><span></span></div>
       </main>
@@ -282,10 +341,23 @@ async function startAsrServer() {
  */
 function killAsrProcess() {
   if (!asrProcess) return;
-  const pid = asrProcess.pid;
+  const processToKill = asrProcess;
   asrProcess = null; // Prevent double-kill from multiple quit events
+  killChildProcessTree(processToKill, "ASR");
+}
 
-  console.log(`[ASR] Killing ASR process tree (PID ${pid})...`);
+function killWebProcess() {
+  if (!webProcess) return;
+  const processToKill = webProcess;
+  webProcess = null;
+  killChildProcessTree(processToKill, "WEB");
+}
+
+function killChildProcessTree(childProcess, label) {
+  const pid = childProcess?.pid;
+  if (!pid) return;
+
+  console.log(`[${label}] Killing process tree (PID ${pid})...`);
   if (process.platform === "win32") {
     try {
       spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
@@ -293,7 +365,7 @@ function killAsrProcess() {
         windowsHide: true,
       });
     } catch (e) {
-      console.error("[ASR] taskkill failed:", e);
+      console.error(`[${label}] taskkill failed:`, e);
     }
   } else {
     try {
@@ -302,7 +374,7 @@ function killAsrProcess() {
       // Process may already be dead
     }
   }
-  console.log("[ASR] ASR process killed.");
+  console.log(`[${label}] Process killed.`);
 }
 
 function createWindow() {
@@ -333,11 +405,35 @@ async function loadFrontendWhenReady() {
 }
 
 async function launchMainExperience() {
-  const frontendReady = await loadFrontendWhenReady();
-  if (!frontendReady) {
+  await startBundledWebServer();
+  await startAsrServer();
+
+  const [frontendReady, asrReady] = await Promise.all([
+    loadFrontendWhenReady(),
+    waitForAsrHealth(1000).then((initialReady) => {
+      if (initialReady) {
+        return true;
+      }
+
+      return (async () => {
+        for (let attempt = 0; attempt < 60; attempt += 1) {
+          const ready = await waitForAsrHealth(1000);
+          if (ready) {
+            return true;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+        return false;
+      })();
+    }),
+  ]);
+
+  if (!frontendReady || !asrReady) {
+    if (!asrReady) {
+      console.error(`[ASR] Backend did not become ready at ${ASR_HEALTH_URL}`);
+    }
     return;
   }
-  await startAsrServer();
 }
 
 app.whenReady().then(() => {
@@ -355,10 +451,12 @@ app.whenReady().then(() => {
 // Clean up ASR process on quit – use before-quit as primary, window-all-closed as fallback
 app.on("before-quit", () => {
   killAsrProcess();
+  killWebProcess();
 });
 
 app.on("window-all-closed", () => {
   killAsrProcess();
+  killWebProcess();
   if (process.platform !== "darwin") {
     app.quit();
   }

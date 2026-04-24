@@ -9,8 +9,8 @@
     "start:web": "next start",
     "dev:electron": "wait-on tcp:3000 && electron .",
     "dev": "concurrently \"npm run dev:web\" \"npm run dev:electron\"",
-    "build": "next build",
-    "dist": "npm run build && electron-builder"
+    "build": "npm run build:web",
+    "dist": "npm run build:web && electron-builder"
   },
   "dependencies": {
     "axios": "^1.13.1",
@@ -22,6 +22,7 @@
   "build": {
     "appId": "com.vibecode.meetingnote",
     "productName": "MeetingNote",
+    "electronDist": "node_modules/electron/dist",
     "files": [
       ".next/**/*",
       "public/**/*",

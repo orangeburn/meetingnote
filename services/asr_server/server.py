@@ -765,8 +765,6 @@ print(f"[INFO] ffmpeg binary: {FFMPEG_BIN}")
 @app.on_event("startup")
 def warmup_asr_engine() -> None:
     _recover_incomplete_jobs()
-    # Warm the ASR model only after lightweight services are already up.
-    engine.ensure_initialized(auto_download=False)
 
 # ---------------------------------------------------------------------------
 # Job control signals: allow pausing / cancelling running or queued jobs.
@@ -907,6 +905,7 @@ def download_status() -> JSONResponse:
     cache_dir = MODEL_DIR.parent
     downloaded_bytes = get_dir_size(cache_dir)
     return JSONResponse({
+        "ready": engine.ready,
         "is_downloading": engine.is_downloading,
         "initializing": engine.is_initializing,
         "model_complete": engine.check_model_complete(log_missing=False),

@@ -4,6 +4,8 @@ import axios from "axios";
 export interface ModelStatus {
   needsDownload: boolean;
   isDownloading: boolean;
+  isInitializing: boolean;
+  isReady: boolean;
   downloadedBytes: number;
   error: string | null;
   isBackendOffline: boolean;
@@ -17,6 +19,8 @@ export function useModelCheck(): ModelStatus {
   const [status, setStatus] = useState<ModelStatus>({
     needsDownload: false,
     isDownloading: false,
+    isInitializing: false,
+    isReady: false,
     downloadedBytes: 0,
     error: null,
     isBackendOffline: true,
@@ -36,7 +40,9 @@ export function useModelCheck(): ModelStatus {
         const data = res.data;
         setStatus(prev => ({
           ...prev,
+          isReady: Boolean(data.ready),
           isDownloading: data.is_downloading,
+          isInitializing: data.initializing,
           downloadedBytes: data.downloaded_bytes || 0,
           needsDownload: !data.model_complete,
           isBackendOffline: false,
@@ -44,7 +50,7 @@ export function useModelCheck(): ModelStatus {
           error: data.last_error || null
         }));
 
-        if (data.model_complete && !data.is_downloading) {
+        if (data.ready && !data.is_downloading && !data.initializing) {
           if (pollingInterval) {
             clearInterval(pollingInterval);
             pollingInterval = null;
@@ -57,11 +63,17 @@ export function useModelCheck(): ModelStatus {
       }
     };
 
-    const startDownload = async () => {
+    const startModelPreparation = async () => {
       try {
         await axios.post(`${API_BASE}/api/model/download`);
         if (isCancelled) return;
-        setStatus(prev => ({ ...prev, isDownloading: true, error: null }));
+        setStatus(prev => ({
+          ...prev,
+          isDownloading: prev.needsDownload,
+          isInitializing: true,
+          error: null,
+        }));
+        void pollStatus();
         if (pollingInterval) clearInterval(pollingInterval);
         pollingInterval = setInterval(pollStatus, 2000);
       } catch (err: any) {
@@ -82,26 +94,36 @@ export function useModelCheck(): ModelStatus {
           healthRetryInterval = null;
         }
 
-        if (!data.model_complete) {
+        const isReady = Boolean(data.ready);
+        const needsDownload = !data.model_complete;
+        const isInitializing = Boolean(data.initializing);
+        const isDownloading = Boolean(data.is_downloading);
+        const needsPreparation = !isReady;
+
+        if (needsPreparation) {
           setStatus(prev => ({ 
             ...prev, 
-            needsDownload: true, 
+            isReady,
+            needsDownload,
+            isDownloading,
+            isInitializing,
             isBackendOffline: false,
             hasChecked: true,
             error: data.last_error || null 
           }));
-          // If model is incomplete, proactively request download once.
-          // This avoids getting stuck when backend reports a non-fatal pre-download message.
-          if (!data.is_downloading && !hasRequestedDownload.current) {
+
+          if (!isDownloading && !isInitializing && !hasRequestedDownload.current) {
             hasRequestedDownload.current = true;
-            startDownload();
+            startModelPreparation();
           }
         } else {
           hasRequestedDownload.current = false;
           setStatus(prev => ({ 
             ...prev, 
-            needsDownload: false, 
-            isDownloading: false, 
+            isReady: true,
+            needsDownload: false,
+            isDownloading: false,
+            isInitializing: false,
             isBackendOffline: false,
             hasChecked: true,
             error: null 
