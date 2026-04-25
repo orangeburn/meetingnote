@@ -8,6 +8,8 @@ records
 __pycache__
 *.pyc
 scratch/
+tsconfig.tsbuildinfo
+services/asr_server/meetingnote.db
 services/asr_server/models/
 services/asr_server/vendor/ffmpeg/win32/ffmpeg.exe
 services/asr_server/vendor/ffmpeg/win32/ffprobe.exe

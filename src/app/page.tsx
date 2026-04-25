@@ -1,12 +1,16 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import Image from "next/image";
 import axios from "axios";
 import { ModelDownloadModal } from "@/components/ModelDownloadModal";
 import { AppFrame, Button, PageContainer } from "@/design-system/primitives";
 import {
+  canFetchTaskDetail,
   createTaskFromFile,
+  fetchTaskById,
   fetchTasksFromApi,
+  hasTaskDetailContent,
   normalizeTask,
   renderMarkdown,
   setTaskTitleOverride,
@@ -89,6 +93,7 @@ export default function HomePage() {
   const [titleDrafts, setTitleDrafts] = useState<Record<string, string>>({});
   const [savingTitleTaskId, setSavingTitleTaskId] = useState<string | null>(null);
   const autoRetryRef = useRef<Map<string, number>>(new Map());
+  const detailQueryRef = useRef<Map<string, string>>(new Map());
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
   function hasActiveRemoteTask(taskList: TranscriptionTask[]) {
@@ -128,6 +133,17 @@ export default function HomePage() {
   }
 
   function mergeTaskWithRemoteState(localTask: TranscriptionTask, remoteTask: TranscriptionTask): TranscriptionTask {
+    const nextTask = { ...remoteTask };
+
+    // Preservation: If the remote summary doesn't have segments/markdown, but our local state does,
+    // we keep the local state to avoid clearing the UI.
+    if ((!nextTask.segments || nextTask.segments.length === 0) && localTask.segments && localTask.segments.length > 0) {
+      nextTask.segments = localTask.segments;
+    }
+    if (!nextTask.markdown && localTask.markdown) {
+      nextTask.markdown = localTask.markdown;
+    }
+
     const keepPausing =
       localTask.status === "pausing" &&
       (remoteTask.status === "processing" || remoteTask.status === "queued");
@@ -137,7 +153,7 @@ export default function HomePage() {
 
     if (keepPausing) {
       return {
-        ...remoteTask,
+        ...nextTask,
         status: "pausing",
         statusText: "暂停中，将在当前片段处理完成后停止",
       };
@@ -145,13 +161,13 @@ export default function HomePage() {
 
     if (keepResuming) {
       return {
-        ...remoteTask,
+        ...nextTask,
         status: "resuming",
         statusText: "重启中，正在恢复任务处理",
       };
     }
 
-    return remoteTask;
+    return nextTask;
   }
 
   function exportTextWithoutTimestamps(markdown: string, fileName: string) {
@@ -692,6 +708,56 @@ export default function HomePage() {
     () => tasks.find((task) => task.id === activeTaskId) ?? null,
     [tasks, activeTaskId]
   );
+
+  useEffect(() => {
+    if (!activeTaskId || !activeTask) return;
+
+    if (hasTaskDetailContent(activeTask)) {
+      return;
+    }
+
+    if (!canFetchTaskDetail(activeTask)) {
+      return;
+    }
+
+    const detailQueryKey = `${activeTask.id}:${activeTask.status}:${activeTask.updatedAt}`;
+    if (detailQueryRef.current.get(activeTask.id) === detailQueryKey) {
+      return;
+    }
+    detailQueryRef.current.set(activeTask.id, detailQueryKey);
+
+    let isCancelled = false;
+    const fetchDetails = async () => {
+      try {
+        const detail = await fetchTaskById(activeTaskId);
+        if (isCancelled || !detail) return;
+        setTasks((current) =>
+          sortTasks(
+            updateTaskCollection(current, activeTaskId, (prev) => ({
+              ...prev,
+              ...detail,
+            }))
+          )
+        );
+      } catch (err) {
+        detailQueryRef.current.delete(activeTask.id);
+        console.error("Failed to fetch task details:", err);
+      }
+    };
+
+    void fetchDetails();
+    return () => {
+      isCancelled = true;
+    };
+  }, [
+    activeTaskId,
+    activeTask,
+    activeTask?.id,
+    activeTask?.status,
+    activeTask?.updatedAt,
+    activeTask?.markdown,
+    activeTask?.segments?.length,
+  ]);
   const activeDraft = activeTask ? editorDrafts[activeTask.id] ?? activeTask.markdown : "";
   const activeTitleDraft = activeTask ? titleDrafts[activeTask.id] ?? activeTask.title : "";
   const activeTitleTrimmed = activeTitleDraft.trim();
@@ -705,6 +771,9 @@ export default function HomePage() {
       <PageContainer className="py-4">
         <header className="saas-header-floating">
           <div className="saas-header-left">
+            <div className="saas-brand-mark" aria-hidden="true">
+              <Image src="/logo.png" alt="" width={36} height={36} className="saas-brand-mark-image" />
+            </div>
             <h1 className="saas-header-title">MeetingNote</h1>
           </div>
         </header>

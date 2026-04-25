@@ -1,14 +1,14 @@
 {
   "name": "meetingnote",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "main": "electron/main.js",
   "scripts": {
     "dev:web": "next dev",
     "build:web": "next build",
     "start:web": "next start",
-    "dev:electron": "wait-on tcp:3000 && electron .",
-    "dev": "concurrently \"npm run dev:web\" \"npm run dev:electron\"",
+    "dev:electron": "electron .",
+    "dev": "npm run dev:electron",
     "build": "npm run build:web",
     "dist": "npm run build:web && electron-builder"
   },
@@ -24,8 +24,6 @@
     "productName": "MeetingNote",
     "electronDist": "node_modules/electron/dist",
     "files": [
-      ".next/**/*",
-      "public/**/*",
       "electron/**/*",
       "package.json"
     ],
@@ -33,6 +31,23 @@
       {
         "from": "services/asr_server",
         "to": "services/asr_server"
+      },
+      {
+        "from": ".next/standalone",
+        "to": "next-app",
+        "filter": ["**/*"]
+      },
+      {
+        "from": ".next/standalone/node_modules",
+        "to": "next-app/node_modules"
+      },
+      {
+        "from": "public",
+        "to": "next-app/public"
+      },
+      {
+        "from": ".next/static",
+        "to": "next-app/.next/static"
       }
     ],
     "directories": {

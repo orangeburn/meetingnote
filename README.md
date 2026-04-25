@@ -1,6 +1,6 @@
 # MeetingNote
 
-基于 Next.js、Electron 和 FastAPI/FunASR 的 Windows 会议转写桌面应用。
+MeetingNote 是一款面向 Windows 场景的本地化会议转写应用，帮助用户将音频内容快速转化为结构清晰、可编辑、可导出的会议记录，适用于日常会议纪要整理、访谈归档与语音内容沉淀等办公场景。
 
 当前版本支持：
 - 音频文件上传与排队转写

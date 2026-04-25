@@ -57,7 +57,7 @@ export function ModelDownloadModal() {
       ) : (
         <div className="mt-4">
           <p className="model-status-copy">
-            {needsDownload ? "正在下载语音模型，完成后可直接上传音频。" : "正在加载语音模型，完成后可直接上传音频。"}
+            {needsDownload ? "准备下载语音模型（仅首次），完成后可直接上传。" : "正在初始化语音引擎，这可能需要一点时间。"}
           </p>
           <div className="mt-4 flex flex-col gap-3">
             <div className="relative h-2 w-full overflow-hidden rounded-full bg-slate-100">
@@ -66,19 +66,20 @@ export function ModelDownloadModal() {
 
             <div className="text-sm font-medium text-slate-700">
               {isDownloading
-                ? `正在下载模型... 已缓存 ${downloadedMB} MB`
+                ? `正在下载模型 (已缓存 ${downloadedMB} MB)...`
                 : isInitializing
-                  ? "正在加载模型..."
+                  ? "正在载入模型到内存..."
                   : needsDownload
-                    ? "准备下载模型..."
-                    : "准备加载模型..."}
+                    ? "等待下载..."
+                    : "正在启动服务..."}
             </div>
           </div>
         </div>
       )}
 
       {/* 可以在全局 css 加上此关键帧，或者用 tailwind arbitary values：*/}
-      <style dangerouslySetInnerHTML={{__html: `
+      <style dangerouslySetInnerHTML={{
+        __html: `
         @keyframes slide {
           0% { left: -33%; }
           100% { left: 100%; }

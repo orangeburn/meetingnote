@@ -1,6 +1,9 @@
 from __future__ import annotations
  
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 import math
 import queue
 import sqlite3
@@ -68,6 +71,8 @@ import uvicorn
 
 FUNASR_IMPORT_ERROR = ""
 try:
+    import torch
+    torch.set_num_threads(1)
     from funasr import AutoModel
 except Exception as e:
     AutoModel = None
@@ -91,7 +96,7 @@ app.add_middleware(
 
 MODEL_NAME = "FunAudioLLM/Fun-ASR-Nano-2512"
 MODEL_DIR = Path(__file__).resolve().parent / "models" / "Fun-ASR-Nano-2512"
-FUN_ASR_REPO_DIR = Path(__file__).resolve().parents[2] / "scratch" / "Fun-ASR"
+FUN_ASR_REPO_DIR = Path(__file__).resolve().parent / "vendor" / "Fun-ASR"
 MERGE_GAP_MS = 900
 MAX_SEGMENT_CHARS = 36
 MAX_SINGLE_PASS_SECONDS = 60
@@ -195,11 +200,9 @@ FFMPEG_BIN = resolve_binary("ffmpeg")
 
 class TranscriptionJobStore:
     def __init__(self) -> None:
-        self._jobs: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._db_path = DB_PATH
         self._ensure_db()
-        self._load_jobs()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
@@ -231,6 +234,19 @@ class TranscriptionJobStore:
                 conn.execute("ALTER TABLE transcription_jobs ADD COLUMN audio_path TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
+    def _row_to_job_summary(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "job_id": row["job_id"],
+            "filename": row["filename"],
+            "audio_path": row["audio_path"] if "audio_path" in row.keys() else "",
+            "status": row["status"],
+            "progress": row["progress"],
+            "message": row["message"],
+            "queue_position": row["queue_position"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
     def _row_to_job(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
             "job_id": row["job_id"],
@@ -247,51 +263,18 @@ class TranscriptionJobStore:
             "updated_at": row["updated_at"],
         }
 
-    def _persist_job(self, job: dict[str, Any]) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO transcription_jobs (
-                    job_id, filename, audio_path, status, progress, message, segments_json, markdown,
-                    error, queue_position, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                    filename=excluded.filename,
-                    audio_path=excluded.audio_path,
-                    status=excluded.status,
-                    progress=excluded.progress,
-                    message=excluded.message,
-                    segments_json=excluded.segments_json,
-                    markdown=excluded.markdown,
-                    error=excluded.error,
-                    queue_position=excluded.queue_position,
-                    created_at=excluded.created_at,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    job["job_id"],
-                    job["filename"],
-                    job.get("audio_path", ""),
-                    job["status"],
-                    job["progress"],
-                    job["message"],
-                    json.dumps(job.get("segments", []), ensure_ascii=False),
-                    job.get("markdown", ""),
-                    job.get("error", ""),
-                    job.get("queue_position"),
-                    job["created_at"],
-                    job["updated_at"],
-                ),
-            )
-            conn.commit()
+    def _fetch_job_row(self, conn: sqlite3.Connection, job_id: str) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM transcription_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
 
-    def _load_jobs(self) -> None:
+    def _load_job_from_db(self, job_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM transcription_jobs ORDER BY datetime(updated_at) DESC, created_at DESC"
-            ).fetchall()
-        with self._lock:
-            self._jobs = {row["job_id"]: self._row_to_job(row) for row in rows}
+            row = self._fetch_job_row(conn, job_id)
+        if row is None:
+            return None
+        return self._row_to_job(row)
 
     def create_job(self, filename: str, audio_path: str = "") -> str:
         job_id = uuid.uuid4().hex
@@ -311,42 +294,92 @@ class TranscriptionJobStore:
             "updated_at": now,
         }
         with self._lock:
-            self._jobs[job_id] = job
-        self._persist_job(job)
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO transcription_jobs (
+                        job_id, filename, audio_path, status, progress, message, segments_json, markdown,
+                        error, queue_position, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job["job_id"],
+                        job["filename"],
+                        job.get("audio_path", ""),
+                        job["status"],
+                        job["progress"],
+                        job["message"],
+                        json.dumps(job.get("segments", []), ensure_ascii=False),
+                        job.get("markdown", ""),
+                        job.get("error", ""),
+                        job.get("queue_position"),
+                        job["created_at"],
+                        job["updated_at"],
+                    ),
+                )
+                conn.commit()
         return job_id
 
     def update_job(self, job_id: str, **fields: Any) -> None:
         with self._lock:
-            job = self._jobs.get(job_id)
-            if not job:
-                return
-            job.update(fields)
-            job["updated_at"] = datetime.now().isoformat()
-            snapshot = dict(job)
-        self._persist_job(snapshot)
+            with self._connect() as conn:
+                row = self._fetch_job_row(conn, job_id)
+                if row is None:
+                    return
+                job = self._row_to_job(row)
+                job.update(fields)
+                job["updated_at"] = datetime.now().isoformat()
+                conn.execute(
+                    """
+                    UPDATE transcription_jobs
+                    SET filename = ?,
+                        audio_path = ?,
+                        status = ?,
+                        progress = ?,
+                        message = ?,
+                        segments_json = ?,
+                        markdown = ?,
+                        error = ?,
+                        queue_position = ?,
+                        created_at = ?,
+                        updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (
+                        job["filename"],
+                        job.get("audio_path", ""),
+                        job["status"],
+                        job["progress"],
+                        job["message"],
+                        json.dumps(job.get("segments", []), ensure_ascii=False),
+                        job.get("markdown", ""),
+                        job.get("error", ""),
+                        job.get("queue_position"),
+                        job["created_at"],
+                        job["updated_at"],
+                        job_id,
+                    ),
+                )
+                conn.commit()
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return None
-            return dict(job)
+        return self._load_job_from_db(job_id)
 
     def list_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
-        with self._lock:
-            jobs = sorted(
-                self._jobs.values(),
-                key=lambda item: item.get("updated_at", item.get("created_at", "")),
-                reverse=True,
-            )
-            return [dict(job) for job in jobs[:limit]]
+        # Return only summaries to avoid sending massive markdown/segments data in the sidebar list
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT job_id, filename, audio_path, status, progress, message, queue_position, created_at, updated_at "
+                "FROM transcription_jobs ORDER BY datetime(updated_at) DESC, created_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        return [self._row_to_job_summary(row) for row in rows]
 
     def get_queue_position(self, job_id: str) -> int | None:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return None
-            return job.get("queue_position")
+        job = self._load_job_from_db(job_id)
+        if job is None:
+            return None
+        return job.get("queue_position")
 
 
 class UpdateTranscriptionJobPayload(BaseModel):
@@ -363,7 +396,7 @@ class AsrEngine:
         self.last_warning = ""
         self.is_downloading = False
         self.is_initializing = False
-        self.model_complete = False
+        self.model_complete = self.check_model_complete()
         self.diarization_supported = False
         self._init_lock = threading.Lock()
 

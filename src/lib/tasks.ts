@@ -141,6 +141,15 @@ export function normalizeTask(task: TranscriptionTask): TranscriptionTask {
   };
 }
 
+export function hasTaskDetailContent(task: Pick<TranscriptionTask, "markdown" | "segments">): boolean {
+  return Boolean(task.markdown) || Boolean(task.segments && task.segments.length > 0);
+}
+
+export function canFetchTaskDetail(task: Pick<TranscriptionTask, "status">): boolean {
+  const staticStatuses: JobStatus[] = ["completed", "failed", "paused", "cancelled"];
+  return staticStatuses.includes(task.status);
+}
+
 export function taskFromApi(task: ApiTask): TranscriptionTask {
   const fileName = task.filename || "未命名任务";
   const baseTitle = task.title || fileName.replace(/\.[^/.]+$/, "") || "未命名任务";

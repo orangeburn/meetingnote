@@ -11,6 +11,14 @@ const ASR_PORT = 8765;
 const ASR_HEALTH_URL = `http://127.0.0.1:${ASR_PORT}/health`;
 const APP_URL = "http://localhost:3000";
 
+function getManagedProcessPaths() {
+  const logDir = app.getPath("userData");
+  return {
+    web: path.join(logDir, "web-server.pid"),
+    asr: path.join(logDir, "asr-server.pid"),
+  };
+}
+
 function getAppRootDir() {
   // In packaged apps, extraResources are placed under process.resourcesPath.
   // In dev, __dirname is electron/ so we go one level up to the repo root.
@@ -19,6 +27,13 @@ function getAppRootDir() {
 
 function getPackagedAppDir() {
   return app.isPackaged ? app.getAppPath() : path.join(__dirname, "..");
+}
+
+function getRendererAssetPath(...segments) {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, "next-app", "public", ...segments);
+  }
+  return path.join(__dirname, "..", "public", ...segments);
 }
 
 function getAsrLogPaths() {
@@ -81,6 +96,44 @@ function resolvePythonInvoker() {
   return { cmd: "python", prefixArgs: [] };
 }
 
+function resolveNodeInvoker() {
+  if (app.isPackaged) {
+    return { cmd: process.execPath, prefixArgs: [] };
+  }
+
+  if (process.platform !== "win32") {
+    return { cmd: process.env.NODE || "node", prefixArgs: [] };
+  }
+
+  const candidates = [
+    process.env.NODE,
+    path.join(path.dirname(process.execPath), "node.exe"),
+    path.join(getAppRootDir(), "node_modules", ".bin", "node.exe"),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) {
+      return { cmd: candidate, prefixArgs: [] };
+    }
+  }
+
+  try {
+    const result = spawnSync("where", ["node"], {
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+      timeout: 5000,
+    });
+    const firstLine = (result.stdout || "").toString().split(/\r?\n/)[0]?.trim();
+    if (firstLine && firstLine.toLowerCase().endsWith("node.exe")) {
+      return { cmd: firstLine, prefixArgs: [] };
+    }
+  } catch (_) {
+    // Ignore and fall through to default
+  }
+
+  return { cmd: "node", prefixArgs: [] };
+}
+
 function logSpawnSyncResult(prefix, result) {
   const stdout = (result.stdout || "").toString();
   const stderr = (result.stderr || "").toString();
@@ -104,7 +157,7 @@ function pipePrefixedStream(stream, prefix) {
   });
 }
 
-function waitForAsrHealth(timeoutMs = 1500) {
+function waitForAsrHealth(timeoutMs = 5000) {
   return new Promise((resolve) => {
     const req = http.get(ASR_HEALTH_URL, (res) => {
       const ok = res.statusCode && res.statusCode >= 200 && res.statusCode < 300;
@@ -119,7 +172,7 @@ function waitForAsrHealth(timeoutMs = 1500) {
   });
 }
 
-function waitForUrl(url, timeoutMs = 800) {
+function waitForUrl(url, timeoutMs = 5000) {
   return new Promise((resolve) => {
     const req = http.get(url, (res) => {
       const ok = res.statusCode && res.statusCode >= 200 && res.statusCode < 500;
@@ -142,41 +195,135 @@ function getWebLogPaths() {
   };
 }
 
-async function startBundledWebServer() {
-  if (!app.isPackaged) {
+function readManagedPid(kind) {
+  try {
+    const pidFile = getManagedProcessPaths()[kind];
+    const value = fs.readFileSync(pidFile, "utf8").trim();
+    const pid = Number.parseInt(value, 10);
+    return Number.isFinite(pid) && pid > 0 ? pid : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeManagedPid(kind, pid) {
+  try {
+    const pidFile = getManagedProcessPaths()[kind];
+    fs.writeFileSync(pidFile, String(pid), "utf8");
+  } catch (error) {
+    console.error(`[${kind.toUpperCase()}] Failed to write pid file:`, error);
+  }
+}
+
+function clearManagedPid(kind) {
+  try {
+    const pidFile = getManagedProcessPaths()[kind];
+    if (fs.existsSync(pidFile)) {
+      fs.unlinkSync(pidFile);
+    }
+  } catch (error) {
+    console.error(`[${kind.toUpperCase()}] Failed to clear pid file:`, error);
+  }
+}
+
+function killProcessTreeByPid(pid, label) {
+  if (!pid || pid === process.pid) return;
+
+  console.log(`[${label}] Killing process tree (PID ${pid})...`);
+  if (process.platform === "win32") {
+    try {
+      spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } catch (e) {
+      console.error(`[${label}] taskkill failed:`, e);
+    }
+  } else {
+    try {
+      process.kill(-pid, "SIGTERM");
+    } catch (_) {
+      // Process may already be dead
+    }
+  }
+  console.log(`[${label}] Process killed.`);
+}
+
+function cleanupManagedProcess(kind, label) {
+  const pid = readManagedPid(kind);
+  if (!pid) {
+    clearManagedPid(kind);
     return;
   }
+  killProcessTreeByPid(pid, label);
+  clearManagedPid(kind);
+}
 
+function cleanupStaleManagedProcesses() {
+  cleanupManagedProcess("web", "WEB");
+  cleanupManagedProcess("asr", "ASR");
+}
+
+async function startBundledWebServer() {
   const alreadyRunning = await waitForUrl(APP_URL, 1000);
   if (alreadyRunning) {
+    if (app.isPackaged) {
+      throw new Error(`[WEB] Port 3000 is already occupied by an external process. Refusing to reuse it in packaged mode.`);
+    }
     console.log(`[WEB] Reusing existing web server on ${APP_URL}`);
     return;
-  }
-
-  const serverScriptPath = path.join(getPackagedAppDir(), ".next", "standalone", "server.js");
-  if (!fs.existsSync(serverScriptPath)) {
-    throw new Error(`Packaged Next server not found: ${serverScriptPath}`);
   }
 
   const logPaths = getWebLogPaths();
   const stdoutFd = fs.openSync(logPaths.stdout, "a");
   const stderrFd = fs.openSync(logPaths.stderr, "a");
-  console.log(`[WEB] Launching bundled web server: ${serverScriptPath}`);
   console.log(`[WEB] Logs: ${logPaths.stdout}`);
 
-  webProcess = spawn(process.execPath, [serverScriptPath], {
-    stdio: ["ignore", stdoutFd, stderrFd],
-    shell: false,
-    windowsHide: true,
-    detached: false,
-    env: {
-      ...process.env,
-      ELECTRON_RUN_AS_NODE: "1",
-      HOSTNAME: "127.0.0.1",
-      PORT: "3000",
-      NODE_ENV: "production"
+  if (app.isPackaged) {
+    const serverScriptPath = path.join(process.resourcesPath, "next-app", "server.js");
+    if (!fs.existsSync(serverScriptPath)) {
+      throw new Error(`Packaged Next server not found: ${serverScriptPath}`);
     }
-  });
+
+    const nodeInvoker = resolveNodeInvoker();
+    console.log(`[WEB] Launching bundled web server: ${serverScriptPath}`);
+    webProcess = spawn(nodeInvoker.cmd, [...nodeInvoker.prefixArgs, serverScriptPath], {
+      stdio: ["ignore", stdoutFd, stderrFd],
+      shell: false,
+      windowsHide: true,
+      detached: false,
+      env: {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: "1",
+        HOSTNAME: "127.0.0.1",
+        PORT: "3000",
+        NODE_ENV: "production"
+      }
+    });
+  } else {
+    const nextCliPath = path.join(getAppRootDir(), "node_modules", "next", "dist", "bin", "next");
+    if (!fs.existsSync(nextCliPath)) {
+      throw new Error(`Next CLI not found: ${nextCliPath}`);
+    }
+
+    const nodeInvoker = resolveNodeInvoker();
+    console.log(`[WEB] Launching dev web server: ${nextCliPath} dev`);
+    webProcess = spawn(nodeInvoker.cmd, [...nodeInvoker.prefixArgs, nextCliPath, "dev", "-H", "127.0.0.1", "-p", "3000"], {
+      stdio: ["ignore", stdoutFd, stderrFd],
+      shell: false,
+      windowsHide: true,
+      detached: false,
+      cwd: getAppRootDir(),
+      env: {
+        ...process.env,
+        NODE_ENV: "development"
+      }
+    });
+  }
+
+  if (webProcess?.pid) {
+    writeManagedPid("web", webProcess.pid);
+  }
 
   webProcess.on("error", (error) => {
     console.error("[WEB] Failed to start bundled web server:", error);
@@ -184,11 +331,20 @@ async function startBundledWebServer() {
 
   webProcess.on("close", (code) => {
     console.log(`[WEB] Bundled web server exited with code ${code}`);
+    clearManagedPid("web");
     webProcess = null;
   });
 }
 
 function buildSplashHtml() {
+  let logoDataUrl = "";
+  try {
+    const logoBuffer = fs.readFileSync(getRendererAssetPath("logo.png"));
+    logoDataUrl = `data:image/png;base64,${logoBuffer.toString("base64")}`;
+  } catch (_) {
+    logoDataUrl = "";
+  }
+
   return `<!doctype html>
   <html lang="zh-CN">
     <head>
@@ -233,6 +389,30 @@ function buildSplashHtml() {
           letter-spacing: 0.12em;
           text-transform: uppercase;
           color: var(--muted);
+        }
+        .brand {
+          display: flex;
+          align-items: center;
+          gap: 14px;
+          margin-bottom: 10px;
+        }
+        .brand-mark {
+          width: 42px;
+          height: 42px;
+          overflow: hidden;
+          border-radius: 10px;
+          flex: 0 0 auto;
+          box-shadow: 0 12px 28px rgba(23, 33, 43, 0.14);
+          background: rgba(255,255,255,0.95);
+        }
+        .brand-mark img {
+          display: block;
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+        }
+        .brand-copy {
+          min-width: 0;
         }
         h1 {
           margin: 0;
@@ -283,7 +463,12 @@ function buildSplashHtml() {
     </head>
     <body>
       <main class="shell">
-        <p class="eyebrow">MeetingNote</p>
+        <div class="brand">
+          <div class="brand-mark">${logoDataUrl ? `<img src="${logoDataUrl}" alt="MeetingNote logo" />` : ""}</div>
+          <div class="brand-copy">
+            <p class="eyebrow">MeetingNote</p>
+          </div>
+        </div>
         <h1>正在启动应用</h1>
         <p>正在载入应用界面、任务数据与语音服务，请稍等片刻。</p>
         <div class="row">
@@ -299,6 +484,9 @@ function buildSplashHtml() {
 async function startAsrServer() {
   const alreadyRunning = await waitForAsrHealth();
   if (alreadyRunning) {
+    if (app.isPackaged) {
+      throw new Error(`[ASR] Port ${ASR_PORT} is already occupied by an external process. Refusing to reuse it in packaged mode.`);
+    }
     console.log(`[ASR] Reusing existing ASR server on ${ASR_HEALTH_URL}`);
     return;
   }
@@ -325,12 +513,17 @@ async function startAsrServer() {
     }
   });
 
+  if (asrProcess?.pid) {
+    writeManagedPid("asr", asrProcess.pid);
+  }
+
   asrProcess.on("error", (error) => {
     console.error("[ASR] Failed to start ASR server:", error);
   });
 
   asrProcess.on("close", (code) => {
     console.log(`ASR server exited with code ${code}`);
+    clearManagedPid("asr");
     asrProcess = null;
   });
 }
@@ -340,41 +533,31 @@ async function startAsrServer() {
  * Uses spawnSync to guarantee the process is terminated before Electron exits.
  */
 function killAsrProcess() {
-  if (!asrProcess) return;
+  if (!asrProcess) {
+    clearManagedPid("asr");
+    return;
+  }
   const processToKill = asrProcess;
   asrProcess = null; // Prevent double-kill from multiple quit events
   killChildProcessTree(processToKill, "ASR");
+  clearManagedPid("asr");
 }
 
 function killWebProcess() {
-  if (!webProcess) return;
+  if (!webProcess) {
+    clearManagedPid("web");
+    return;
+  }
   const processToKill = webProcess;
   webProcess = null;
   killChildProcessTree(processToKill, "WEB");
+  clearManagedPid("web");
 }
 
 function killChildProcessTree(childProcess, label) {
   const pid = childProcess?.pid;
   if (!pid) return;
-
-  console.log(`[${label}] Killing process tree (PID ${pid})...`);
-  if (process.platform === "win32") {
-    try {
-      spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        stdio: "ignore",
-        windowsHide: true,
-      });
-    } catch (e) {
-      console.error(`[${label}] taskkill failed:`, e);
-    }
-  } else {
-    try {
-      process.kill(-pid, "SIGTERM");
-    } catch (_) {
-      // Process may already be dead
-    }
-  }
-  console.log(`[${label}] Process killed.`);
+  killProcessTreeByPid(pid, label);
 }
 
 function createWindow() {
@@ -383,6 +566,7 @@ function createWindow() {
     height: 900,
     backgroundColor: "#f5f7fb",
     show: true,
+    icon: getRendererAssetPath("logo.png"),
     webPreferences: {
       contextIsolation: true
     }
@@ -408,35 +592,32 @@ async function launchMainExperience() {
   await startBundledWebServer();
   await startAsrServer();
 
-  const [frontendReady, asrReady] = await Promise.all([
-    loadFrontendWhenReady(),
-    waitForAsrHealth(1000).then((initialReady) => {
-      if (initialReady) {
-        return true;
-      }
-
-      return (async () => {
-        for (let attempt = 0; attempt < 60; attempt += 1) {
-          const ready = await waitForAsrHealth(1000);
-          if (ready) {
-            return true;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 500));
-        }
-        return false;
-      })();
-    }),
-  ]);
-
-  if (!frontendReady || !asrReady) {
-    if (!asrReady) {
-      console.error(`[ASR] Backend did not become ready at ${ASR_HEALTH_URL}`);
-    }
+  const frontendReady = await loadFrontendWhenReady();
+  if (!frontendReady) {
     return;
   }
+
+  void (async () => {
+    const initialReady = await waitForAsrHealth(1000);
+    if (initialReady) {
+      return;
+    }
+
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const ready = await waitForAsrHealth(1000);
+      if (ready) {
+        console.log(`[ASR] Backend became ready at ${ASR_HEALTH_URL}`);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    console.error(`[ASR] Backend did not become ready at ${ASR_HEALTH_URL}`);
+  })();
 }
 
 app.whenReady().then(() => {
+  cleanupStaleManagedProcesses();
   createWindow();
   void launchMainExperience();
 
